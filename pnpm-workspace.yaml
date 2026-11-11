@@ -3,6 +3,12 @@
 #     安装相关设置必须写在这里（pnpm 10 也读这份文件，两处并存不冲突，.npmrc 留给 pnpm 10）。
 #   * 构建脚本白名单由 `allowBuilds` 取代 `onlyBuiltDependencies`（旧键保留给 pnpm 10 的 CI）。
 
+# pnpm 9 读到本文件即按 workspace 解析，缺少 packages 会直接报
+# "packages field missing or empty"（连 pnpm dev / pnpm run 都不放行）。
+# 本仓库是单包工程，声明根目录即可；pnpm 10/11 同样接受该字段。
+packages:
+  - "."
+
 # 工程常放在 exFAT 盘（不支持符号链接），必须 hoisted；否则 pnpm 11 会 ERR_PNPM_EISDIR。
 nodeLinker: hoisted
 shamefullyHoist: true
