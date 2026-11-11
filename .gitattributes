@@ -7,3 +7,4 @@
 *.icns binary
 *.woff2 binary
 pnpm-lock.yaml -text
+*.bat -text
