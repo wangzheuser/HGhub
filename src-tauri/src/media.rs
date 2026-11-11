@@ -9,7 +9,8 @@ use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::http::{Response, StatusCode};
 
@@ -36,14 +37,66 @@ static PL_CACHE: Lazy<Mutex<HashMap<String, Arc<String>>>> =
 /// AES Key / 分片：拖进度条时同一 key、同一片会被反复拉，缓存住省一次往返。
 static KEY_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static SEG_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 
 const IMG_CACHE_MAX: usize = 240;
 const PL_CACHE_MAX: usize = 60;
 const KEY_CACHE_MAX: usize = 120;
-const SEG_CACHE_MAX: usize = 36;
+/// 分片缓存按 LRU 淘汰（见 [`lru_put`]），容量按「整集大部分分片」估算：
+/// 单集约 186 片 × 2.1MB，全缓存不现实，80 片（≈170MB）足以覆盖正常观看
+/// 的前后各 30 秒，让回看与小幅前跳直接命中。
+const SEG_CACHE_MAX: usize = 80;
 const SEG_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// 带访问序号的缓存条目。淘汰时选**最久未使用**的，而不是最早插入的：
+/// 拖动进度条回看时，FIFO 往往先把用户刚看过的分片淘汰掉，白丢一次 3 秒下载。
+struct LruEntry<V> {
+    value: V,
+    used: u64,
+}
+
+/// 全局单调递增的访问序号，只用于 LRU 排序，不参与业务判断。
+static ACCESS_SEQ: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
+
+fn next_seq() -> u64 {
+    ACCESS_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+static SEG_CACHE: Lazy<Mutex<HashMap<String, LruEntry<(String, Arc<Vec<u8>>)>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 读缓存并刷新其 LRU 序号（命中即视为最近使用）。
+fn lru_get<V: Clone>(
+    map: &Mutex<HashMap<String, LruEntry<V>>>,
+    key: &str,
+) -> Option<V> {
+    let seq = next_seq();
+    let mut m = match map.lock() {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    let entry = m.get_mut(key)?;
+    entry.used = seq;
+    Some(entry.value.clone())
+}
+
+/// 写缓存；满了就淘汰最久未使用的一条。
+fn lru_put<V>(map: &Mutex<HashMap<String, LruEntry<V>>>, key: String, val: V, max: usize) {
+    let seq = next_seq();
+    let mut m = match map.lock() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if m.len() >= max && !m.contains_key(&key) {
+        if let Some(victim) = m
+            .iter()
+            .min_by_key(|(_, entry)| entry.used)
+            .map(|(k, _)| k.clone())
+        {
+            m.remove(&victim);
+        }
+    }
+    m.insert(key, LruEntry { value: val, used: seq });
+}
 
 fn cache_put<V: Clone>(map: &Mutex<HashMap<String, V>>, key: String, val: V, max: usize) {
     let mut m = map.lock().unwrap();
@@ -53,6 +106,60 @@ fn cache_put<V: Clone>(map: &Mutex<HashMap<String, V>>, key: String, val: V, max
         }
     }
     m.insert(key, val);
+}
+
+/* ───────────────────────── 预取 ───────────────────────── */
+
+/// 播放列表 → 分片序列（原始上游地址）。预取靠它判断「当前片后面还有哪些」。
+static PL_SEGMENTS: Lazy<Mutex<HashMap<String, Arc<Vec<String>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+/// 分片 → (所属播放列表, 下标)。反查用，key 是上游原始分片 URL。
+static SEG_OWNER: Lazy<Mutex<HashMap<String, (String, usize)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+/// 正在预取的分片，避免同一片被重复排队。
+static PREFETCH_ACTIVE: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+static PREFETCH_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// 预取代际号：每次前台播放位置变化（新的分片请求）就换代，
+/// 旧代际排队的任务在真正下载前发现自己过期就放弃。
+/// 没有它，远距离跳转后旧位置的预取仍占着并发额度，
+/// 新位置的分片反而没人预取（实测跳转后第 4 片要 7 秒）。
+static PREFETCH_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// 预取领先片数：单连接吞吐约 0.35–0.7MB/s（实测，受 RTT 限制），
+/// 总带宽约 4MB/s 被所有连接平分，所以「并发越高单任务越慢」。
+/// 播放 2–6 秒一片，领先 5 片足以覆盖一次小幅前跳/回看，
+/// 又不会让预取把带宽占满、把前台请求拖慢（实测 8 片 + 4 并发时，
+/// 个别分片反而要 8 秒以上）。
+const PREFETCH_AHEAD: usize = 5;
+/// 预取并发上限：3 路并行 ≈ 1.2 片/秒，跟得上播放节奏，同时给前台留一半带宽。
+const PREFETCH_MAX_INFLIGHT: usize = 3;
+
+/// 分片级下载锁（singleflight）：同一片同时只允许一次真实下载。
+///
+/// 没有它会出现「前台请求与预取任务各下一遍」：实测同一片被并发拉两次，
+/// 前台反而要等 14 秒（连接池被占 + 重复流量）。有了它，前台遇到正在预取的
+/// 分片时只需等那次下载结束，然后直接拿缓存。
+static SEG_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn seg_lock(url: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = match SEG_LOCKS.lock() {
+        Ok(l) => l,
+        Err(_) => return Arc::new(tokio::sync::Mutex::new(())),
+    };
+    if let Some(existing) = locks.get(url) {
+        return existing.clone();
+    }
+    // 防御：长时间追剧会积累大量锁，超阈值清理已无人持有的
+    if locks.len() >= 512 {
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        if locks.len() >= 512 {
+            locks.clear();
+        }
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(url.to_string(), lock.clone());
+    lock
 }
 
 /* ───────────────────────── AES ───────────────────────── */
@@ -207,13 +314,38 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
     if !text.trim_start_matches('\u{feff}').starts_with("#EXTM3U") {
         return Err("响应不是 HLS 播放列表".into());
     }
-    let arc = Arc::new(rewrite_playlist(url, text, prefix));
+    let (rewritten, segments) = rewrite_playlist(url, text, prefix);
+    // 注册「列表 → 分片序列」与反向索引，供播放时的后台预取定位后继分片
+    register_playlist(url, &segments);
+    let arc = Arc::new(rewritten);
     cache_put(&PL_CACHE, cache_key, arc.clone(), PL_CACHE_MAX);
     Ok(arc)
 }
 
-fn rewrite_playlist(url: &str, text: &str, prefix: &str) -> String {
+/// 记录某份播放列表的分片顺序。重新加载同一份列表时先清掉旧映射
+/// （分片序号可能变化，旧下标会让预取取到错误位置）。
+fn register_playlist(playlist_url: &str, segments: &[String]) {
+    if let Ok(mut owner) = SEG_OWNER.lock() {
+        owner.retain(|_, (owner_pl, _)| owner_pl != playlist_url);
+        // 防御：长时间追剧会累积很多列表，超阈值直接清空（预取只是加速，丢了也能工作）
+        if owner.len() > 4096 {
+            owner.clear();
+        }
+        for (index, segment) in segments.iter().enumerate() {
+            owner.insert(segment.clone(), (playlist_url.to_string(), index));
+        }
+    }
+    if let Ok(mut lists) = PL_SEGMENTS.lock() {
+        if lists.len() >= 64 {
+            lists.clear();
+        }
+        lists.insert(playlist_url.to_string(), Arc::new(segments.to_vec()));
+    }
+}
+
+fn rewrite_playlist(url: &str, text: &str, prefix: &str) -> (String, Vec<String>) {
     let mut out = String::with_capacity(text.len() + 512);
+    let mut segments: Vec<String> = Vec::new();
     for raw in text.trim_start_matches('\u{feff}').lines() {
         let line = raw.trim_end();
         if line.is_empty() {
@@ -252,12 +384,13 @@ fn rewrite_playlist(url: &str, text: &str, prefix: &str) -> String {
             }
         } else {
             let absolute = absolutize(url, line);
+            segments.push(absolute.clone());
             out.push_str(&format!("{prefix}/seg?u={}", enc(&absolute)));
         }
         out.push('\n');
     }
 
-    out
+    (out, segments)
 }
 
 fn absolutize_uri_in_attr(base: &str, line: &str) -> String {
@@ -265,14 +398,42 @@ fn absolutize_uri_in_attr(base: &str, line: &str) -> String {
 }
 
 /// 分片 / AES Key 带内存缓存：拖动进度条时避免重复拉取同一片造成卡顿。
+///
+/// 未命中时走 singleflight：拿到分片级锁后再查一次缓存，避免与后台预取
+/// 重复下载同一片（实测重复下载会让前台等 10 秒以上）。
 pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), String> {
     if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url).cloned() {
         return Ok((Some(ctype), hit));
     }
-    if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url).cloned() {
+    if let Some((ctype, hit)) = lru_get(&SEG_CACHE, url) {
+        // 命中缓存也要触发后继预取：用户可能停下来反复回看同一段，
+        // 只靠「下载成功」触发会让预取停摆。
+        schedule_prefetch(url);
         return Ok((Some(ctype), hit));
     }
+
+    let lock = seg_lock(url);
+    let _guard = lock.lock().await;
+    // 双检：等锁期间后台预取可能已经把这一片填进缓存
+    if let Some((ctype, hit)) = lru_get(&SEG_CACHE, url) {
+        drop(_guard);
+        schedule_prefetch(url);
+        return Ok((Some(ctype), hit));
+    }
+
     let (ctype, bytes) = fetch_bytes(url).await?;
+    let stored = store_segment(url, ctype, bytes);
+    drop(_guard);
+    schedule_prefetch(url);
+    Ok(stored)
+}
+
+/// 按大小分流写缓存（Key 很小、分片较大），返回给调用方的 (ctype, bytes)。
+fn store_segment(
+    url: &str,
+    ctype: Option<String>,
+    bytes: Vec<u8>,
+) -> (Option<String>, Arc<Vec<u8>>) {
     let mime = ctype.clone().unwrap_or_else(|| {
         let p = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
         if p.ends_with(".ts") {
@@ -288,9 +449,127 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     if len <= 65536 {
         cache_put(&KEY_CACHE, url.to_string(), (mime.clone(), arc.clone()), KEY_CACHE_MAX);
     } else if len <= SEG_CACHE_MAX_BYTES {
-        cache_put(&SEG_CACHE, url.to_string(), (mime.clone(), arc.clone()), SEG_CACHE_MAX);
+        lru_put(&SEG_CACHE, url.to_string(), (mime.clone(), arc.clone()), SEG_CACHE_MAX);
     }
-    Ok((Some(mime), arc))
+    (Some(mime), arc)
+}
+
+/// 后台预取当前分片之后若干片。
+///
+/// 为什么必须预取：单连接吞吐实测只有 0.35–0.7MB/s（hyper 小块读取被 RTT 放大），
+/// 一片 2.1MB 要 3–5 秒，靠「拖动后再下载」永远达不到 1 秒内。把后继分片提前
+/// 放进缓存，正常观看时进度条附近都是命中，拖动才是毫秒级。
+///
+/// 只由 `load_segment` 触发 —— 没有播放就没有分片请求，预取自然停摆，
+/// 符合「仅播放中预取」的约定；并发上限 [`PREFETCH_MAX_INFLIGHT`] 给前台让路。
+fn schedule_prefetch(current: &str) {
+    let Some((playlist, index)) = SEG_OWNER
+        .lock()
+        .ok()
+        .and_then(|owner| owner.get(current).cloned())
+    else {
+        return;
+    };
+    let Some(segments) = PL_SEGMENTS
+        .lock()
+        .ok()
+        .and_then(|lists| lists.get(&playlist).cloned())
+    else {
+        return;
+    };
+
+    let start = index + 1;
+    if start >= segments.len() {
+        return;
+    }
+    let end = (start + PREFETCH_AHEAD).min(segments.len());
+
+    // 换代：本次播放位置之后的排队任务才算有效，旧位置的任务自动作废
+    let generation = PREFETCH_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+
+    for segment in &segments[start..end] {
+        if PREFETCH_INFLIGHT.load(Ordering::Relaxed) >= PREFETCH_MAX_INFLIGHT {
+            break;
+        }
+        // 已在缓存里就不必再排（lru_get 会刷新序号，这里只看存在性）
+        if SEG_CACHE.lock().is_ok_and(|cache| cache.contains_key(segment)) {
+            continue;
+        }
+        // 同一片只排一次，避免连续拖动把队列塞满重复任务
+        let queued = match PREFETCH_ACTIVE.lock() {
+            Ok(mut active) => {
+                if active.contains(segment) {
+                    true
+                } else {
+                    if active.len() >= 64 {
+                        active.clear();
+                    }
+                    active.insert(segment.clone());
+                    false
+                }
+            }
+            Err(_) => true,
+        };
+        if queued {
+            continue;
+        }
+
+        PREFETCH_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+        let url = segment.clone();
+        tauri::async_runtime::spawn(async move {
+            prefetch_one(&url, generation).await;
+            PREFETCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut active) = PREFETCH_ACTIVE.lock() {
+                active.remove(&url);
+            }
+        });
+    }
+}
+
+/// 单个预取任务：失败静默（前台请求会自己重试，预取只是提前量）。
+async fn prefetch_one(url: &str, generation: u64) {
+    // 排到自己时已经换代（用户跳到别的位置了）：直接放弃，把额度让给新位置
+    if PREFETCH_GEN.load(Ordering::Relaxed) != generation {
+        return;
+    }
+    if SEG_CACHE.lock().is_ok_and(|cache| cache.contains_key(url)) {
+        return;
+    }
+    // 与前台共用同一把分片锁：前台正在下这一片时，预取直接放弃（前台优先级更高）
+    let lock = seg_lock(url);
+    let Ok(_guard) = lock.try_lock() else {
+        return;
+    };
+    // 拿到锁后再确认一次代际：等锁期间用户可能已经跳走
+    if PREFETCH_GEN.load(Ordering::Relaxed) != generation {
+        return;
+    }
+    if SEG_CACHE.lock().is_ok_and(|cache| cache.contains_key(url)) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    match fetch_bytes(url).await {
+        Ok((ctype, bytes)) => {
+            let len = bytes.len();
+            store_segment(url, ctype, bytes);
+            crate::playback_log::record(
+                "prefetch.ok",
+                serde_json::json!({
+                    "resource": crate::playback_log::resource_id(url),
+                    "bytes": len,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+        }
+        Err(error) => crate::playback_log::record(
+            "prefetch.fail",
+            serde_json::json!({
+                "resource": crate::playback_log::resource_id(url),
+                "error_kind": crate::playback_log::error_kind(&error),
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }),
+        ),
+    }
 }
 
 /// 清空封面 / 播放列表 / Key / 分片内存缓存
@@ -305,6 +584,16 @@ pub fn clear_caches() {
         g.clear();
     }
     if let Ok(mut g) = SEG_CACHE.lock() {
+        g.clear();
+    }
+    // 预取索引跟着缓存一起清：缓存没了，索引指向的分片也不再「已就绪」
+    if let Ok(mut g) = PL_SEGMENTS.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = SEG_OWNER.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = PREFETCH_ACTIVE.lock() {
         g.clear();
     }
 }
@@ -338,13 +627,18 @@ fn segment_response(
         || bytes.starts_with(b"\xef\xbb\xbf#EXTM3U");
     if playlist {
         return match std::str::from_utf8(&bytes) {
-            Ok(text) => respond(
-                200,
-                "application/vnd.apple.mpegurl",
-                rewrite_playlist(target, text, origin).into_bytes(),
-                // Rewriting nested URIs does not require disabling the upstream cache policy.
-                "public, max-age=3600",
-            ),
+            Ok(text) => {
+                // 内层子清单同样登记分片序列：预取对多级 m3u8 也要能定位后继分片
+                let (rewritten, segments) = rewrite_playlist(target, text, origin);
+                register_playlist(target, &segments);
+                respond(
+                    200,
+                    "application/vnd.apple.mpegurl",
+                    rewritten.into_bytes(),
+                    // Rewriting nested URIs does not require disabling the upstream cache policy.
+                    "public, max-age=3600",
+                )
+            }
             Err(_) => respond(
                 502,
                 "text/plain",
@@ -423,7 +717,7 @@ mod tests {
     #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
         let line = "#EXTM3U\n#EXT-X-DATERANGE:ID=\"event\",START-DATE=\"2026-11-07T00:00:00Z\",DURATION=4,SCTE35-OUT=0xFC,X-TEXT=\"a,b\",X-ASSET-URI=\"https://evil.example/ad\",X-ASSET-LIST=\"https://evil.example/list.json\"\n";
-        let out = rewrite_playlist("https://cdn.example/master.m3u8", line, LOCAL_ORIGIN);
+        let out = rewrite_playlist("https://cdn.example/master.m3u8", line, LOCAL_ORIGIN).0;
         assert!(out.contains("DURATION=4,SCTE35-OUT=0xFC,X-TEXT=\"a,b\""));
         assert!(out.contains("START-DATE="));
         assert!(!out.contains("evil.example") && !out.contains("X-ASSET"));
@@ -466,7 +760,7 @@ mod tests {
             .headers()
             .contains_key("Access-Control-Allow-Origin"));
         let optional = rewrite_playlist("https://cdn.example/list.m3u8",
-            "#EXTM3U\n#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://other.example/list.json\"\n#EXT-X-DATERANGE:ID=\"ad\",X-ASSET-LIST=\"http://127.0.0.1/assets\"\nsegment.ts\n", LOCAL_ORIGIN);
+            "#EXTM3U\n#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://other.example/list.json\"\n#EXT-X-DATERANGE:ID=\"ad\",X-ASSET-LIST=\"http://127.0.0.1/assets\"\nsegment.ts\n", LOCAL_ORIGIN).0;
         assert!(!optional.contains("CONTENT-STEERING") && !optional.contains("X-ASSET-LIST"));
         assert!(optional.contains("#EXT-X-DATERANGE:ID=\"ad\""));
         let bom = segment_response(
@@ -527,7 +821,13 @@ mod tests {
     fn playlist_rewrite_works() {
         let base = "https://cdn.example/videos5/abc/abc.m3u8?auth_key=9999999999-0-0-deadbeef&v=3&via=hgdj";
         let text = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin?auth_key=9999999999-0-0-deadbeef\"\n#EXTINF:4,\nseg-1.ts?auth_key=9999999999-0-0-deadbeef\n";
-        let body = rewrite_playlist(base, text, LOCAL_ORIGIN);
+        let (body, segments) = rewrite_playlist(base, text, LOCAL_ORIGIN);
+        assert_eq!(segments.len(), 1, "分片序列应被收集供预取使用");
+        assert!(
+            segments[0].starts_with("https://cdn.example/videos5/abc/seg-1.ts"),
+            "收集到的分片必须是绝对地址：{}",
+            segments[0]
+        );
 
         assert!(body.contains("#EXTM3U"), "not a playlist: {body}");
         assert!(

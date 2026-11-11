@@ -991,6 +991,50 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "联网测速：需要 HGHUB_TEST_MEDIA_URL 指向一个可下载的媒体分片"]
+    async fn media_client_download_profile() {
+        // 诊断工具：测量单连接吞吐与 chunk 分布。
+        // 2026-11 实测结论（tp3.drleao.cn，RTT 27ms，2.1MB 分片）：
+        //   reqwest: 91 chunks / avg 23KB / max gap 528ms / 0.35MB/s / 3-6s
+        //   curl 同片: 4.2MB/s / 0.4s
+        // → 瓶颈是 hyper 的小 buffer 读取被 RTT 放大（每次往返只搬 ~23KB），
+        //   与压缩、HTTP/2、连接池、TLS 后端均无关。优化方向：预取 + 并发，而非调参。
+        let raw = std::env::var("HGHUB_TEST_MEDIA_URL").expect("HGHUB_TEST_MEDIA_URL");
+        let target = url::Url::parse(&raw).unwrap();
+
+        let client = reqwest::Client::builder()
+            .user_agent(UA)
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let mut resp = client.get(target.clone()).send().await.unwrap();
+        let headers = started.elapsed();
+        let mut chunks = 0usize;
+        let mut bytes = 0usize;
+        let mut max_gap = Duration::ZERO;
+        let mut last = Instant::now();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            let gap = last.elapsed();
+            if gap > max_gap {
+                max_gap = gap;
+            }
+            last = Instant::now();
+            chunks += 1;
+            bytes += chunk.len();
+        }
+        let total = started.elapsed();
+        let avg = if chunks > 0 { bytes / chunks } else { 0 };
+        eprintln!(
+            "[stream] headers={}ms total={}ms chunks={chunks} bytes={bytes} avg_chunk={avg}B max_gap={}ms speed={:.2}MB/s",
+            headers.as_millis(),
+            total.as_millis(),
+            max_gap.as_millis(),
+            bytes as f64 / 1e6 / total.as_secs_f64().max(1e-6)
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_errors_do_not_retry_but_transient_failures_can_recover() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         for error in [
