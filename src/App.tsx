@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useStore, type Page, type Tab } from "./store";
-import { isMobile, selfTest } from "./api";
+import { isMobile, isTauri, isWeb, logLine, selfTest } from "./api";
 import { addPluginListener, invoke } from "@tauri-apps/api/core";
 import { runBack } from "./back";
 import Home from "./pages/Home";
@@ -187,12 +187,13 @@ function DesktopShell() {
   const { theater, platform } = useStore();
   return (
     <div className={`absolute inset-0 flex flex-col bg-canvas win-root plat-${platform}`}>
-      <DesktopTitleBar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
+      {/* 浏览器有自己的窗口 chrome：标题栏与边缘缩放热区只在 Tauri 窗口内渲染 */}
+      {isTauri && <DesktopTitleBar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />}
       <div className="relative flex-1 min-h-0">
         <ShellInner collapsed={collapsed || theater} theater={theater} />
       </div>
       {/* 边缘缩放热区只对无边框窗口（Windows / Linux）有效，macOS 走原生窗口边框 */}
-      {(platform === "windows" || platform === "linux") && <ResizeHandles />}
+      {isTauri && (platform === "windows" || platform === "linux") && <ResizeHandles />}
     </div>
   );
 }
@@ -274,7 +275,7 @@ export default function App() {
      原生层已默认关闭文本交互（isTextInteractionEnabled=false）；这里在用户触碰输入框时
      重新打开、失焦时再关闭，避免影响搜索/评论/登录等文本输入。 */
   useEffect(() => {
-    if (platform !== "ios") return;
+    if (platform !== "ios" || isWeb) return;
     const setTI = (enabled: boolean) => invoke("set_text_interaction", { enabled }).catch(() => {});
     const INPUTS = 'input, textarea, [contenteditable="true"]';
     const onDown = (e: Event) => {
@@ -306,11 +307,12 @@ export default function App() {
     if (loginOpen) { setLoginOpen(false); return; }
     if (stack.length) { pop(); return; }
     if (tab !== "home") { setTab("home"); return; }
+    if (isWeb) return; // 浏览器没有「退出应用」语义，到顶就停在首页
     invoke("plugin:app|exit", { code: 0 }).catch(() => {});
   };
 
   useEffect(() => {
-    if (platform !== "android") return undefined;
+    if (platform !== "android" || isWeb) return undefined; // 浏览器没有 Tauri 插件事件
     let disposed = false;
     let handle: { unregister: () => Promise<void> } | null = null;
     addPluginListener("app", "back-button", () => backRef.current())
@@ -331,7 +333,7 @@ export default function App() {
   useEffect(() => {
     if (!import.meta.env.DEV) return;
     const t = window.setTimeout(() => {
-      selfTest().then((r) => { invoke("debug_log", { msg: r }).catch(() => {}); }).catch(() => {});
+      selfTest().then((r) => { logLine(r); }).catch(() => {});
     }, 2500);
     return () => window.clearTimeout(t);
   }, []);

@@ -22,7 +22,7 @@ use tauri::http::{Response, StatusCode};
 pub const LOCAL_ORIGIN: &str = "http://hg.localhost";
 /// Linux 走 loopback HTTP：WebKitGTK 的播放器是 GStreamer，它拿不到自定义 scheme。
 #[cfg(target_os = "linux")]
-pub const LOCAL_ORIGIN: &str = crate::linux_http::ORIGIN;
+pub const LOCAL_ORIGIN: &str = crate::bridge_http::ORIGIN;
 #[cfg(not(any(target_os = "windows", target_os = "android", target_os = "linux")))]
 pub const LOCAL_ORIGIN: &str = "hg://localhost";
 

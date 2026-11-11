@@ -1,9 +1,9 @@
 mod api;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+mod bridge_http;
 #[cfg(target_os = "ios")]
 mod ios_layout;
 mod lines;
-#[cfg(target_os = "linux")]
-mod linux_http;
 mod logging;
 #[cfg(target_os = "macos")]
 mod macos_titlebar;
@@ -31,7 +31,7 @@ fn allowed_dev_host(host: &str) -> bool {
         .is_some_and(|v| host.eq_ignore_ascii_case(v.trim()))
 }
 
-fn allowed_frontend_origin(origin: &str) -> bool {
+pub(crate) fn allowed_frontend_origin(origin: &str) -> bool {
     if matches!(
         origin,
         "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
@@ -87,10 +87,11 @@ pub fn run() {
                 let state: tauri::State<Api> = app.state();
                 state.session.bind(dir);
             }
-            // Linux 的 <video> 由 GStreamer 播放，它只认常规 HTTP scheme；
-            // 这里起一个 loopback 代理，前端与 m3u8 改写都指向它（见 linux_http.rs）
-            #[cfg(target_os = "linux")]
-            linux_http::start();
+            // 桌面端起本机 HTTP 桥：浏览器可访问同一套后端（API + 媒体代理 + 静态页）。
+            // Linux 的 <video> 由 GStreamer 播放，它拿不到自定义 scheme，播放链路本来就
+            // 走这个 loopback 端口（见 bridge_http.rs）。绑定失败只记日志，桌面不受影响。
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::bridge_http::start(app.handle().clone());
             // macOS 主窗口在此创建：先按系统红绿灯尺寸算出居中位置（见 macos_titlebar.rs）
             #[cfg(target_os = "macos")]
             macos_titlebar::create_main_window(app)?;

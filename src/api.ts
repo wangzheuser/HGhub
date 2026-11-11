@@ -10,6 +10,15 @@ import type {
 export const APP_VERSION = __APP_VERSION__;
 
 const ua = navigator.userAgent;
+/** 是否在 Tauri WebView 内：桌面/移动窗口为 true，普通浏览器（Vite dev 页、桥托管页）为 false */
+export const isTauri = typeof window === "object" && "__TAURI_INTERNALS__" in window;
+/** 纯浏览器模式：业务调用与本机 HTTP 桥通信（src-tauri/src/bridge_http.rs，端口必须一致） */
+export const isWeb = !isTauri;
+/** 本机桥基址：端口与 Rust 侧 bridge_http::PORT 一致；主机名随页面所在设备解析——
+ *  本机访问（localhost / 127.0.0.1）、局域网设备访问桥托管页（http://<LAN-IP>:17650，
+ *  同源）或 LAN dev 页（http://<LAN-IP>:1420）时，API 与媒体都落在「发起方可达」的
+ *  桥地址上（桥侧 m3u8 也按请求 Host 头改写，两侧公式一致）。 */
+export const BRIDGE = `${location.protocol}//${location.hostname || "127.0.0.1"}:17650`;
 export const isAndroid = /Android/i.test(ua);
 /** iPhone 的 UA 也带「like Mac OS X」，必须先于 macOS 判断；iPadOS 默认伪装成 Mac，用触点数区分。 */
 export const isIos =
@@ -30,14 +39,20 @@ export const webviewVersion =
 /** 移动端（安卓 / iOS）共用触屏界面 */
 export const isMobile = isAndroid || isIos;
 
-/** 媒体基址随平台不同（Rust 侧对应 `media::LOCAL_ORIGIN`，两边必须一致）：
- *  Windows / Android → `http://<scheme>.localhost`（自定义协议，WebView 自己加载）
- *  macOS / iOS → `hg://localhost`（WebKit 的 scheme handler）
- *  Linux → `http://127.0.0.1:17650`：WebKitGTK 的 <video> 由 GStreamer 播放，
+/** 媒体基址随运行环境不同（Rust 侧对应 `media::LOCAL_ORIGIN` / `bridge_http::ORIGIN`，两边必须一致）：
+ *  浏览器 → `http://127.0.0.1:17650`（本机 HTTP 桥，桌面进程内提供 API 与媒体代理）
+ *  Tauri Windows / Android → `http://<scheme>.localhost`（自定义协议，WebView 自己加载）
+ *  Tauri macOS / iOS → `hg://localhost`（WebKit 的 scheme handler）
+ *  Tauri Linux → `http://127.0.0.1:17650`：WebKitGTK 的 <video> 由 GStreamer 播放，
  *          它拿不到自定义 scheme，所以由 Rust 侧在 loopback 上起 HTTP 代理
- *          （`src-tauri/src/linux_http.rs`，端口必须与此一致）。 */
-export const LOCAL =
-  isMacos || isIos ? "hg://localhost" : isLinux ? "http://127.0.0.1:17650" : "http://hg.localhost";
+ *          （`src-tauri/src/bridge_http.rs`，端口必须与此一致）。 */
+export const LOCAL = isWeb
+  ? BRIDGE
+  : isMacos || isIos
+    ? "hg://localhost"
+    : isLinux
+      ? "http://127.0.0.1:17650"
+      : "http://hg.localhost";
 
 /** src 是否已是本地协议地址（避免在详情页把代理地址再包一层） */
 export const isLocalMedia = (src: string) => src.startsWith(`${LOCAL}/`);
@@ -51,8 +66,39 @@ export const playlist = (url: string) => `${LOCAL}/hls?u=${encodeURIComponent(ur
 
 /* ── 调用封装 ───────────────────────────────────────────── */
 
-/** 写一行到应用数据目录 debug.log（用户反馈「打不开」时要的就是它） */
-export const logLine = (msg: string) => invoke("debug_log", { msg }).catch(() => {});
+/** 写一行到应用数据目录 debug.log（用户反馈「打不开」时要的就是它）。
+ *  浏览器模式经桥写入同一文件，桌面与浏览器的日志汇聚一处。 */
+export const logLine = (msg: string) => rawCall("debug_log", { msg }).catch(() => {});
+
+/** 浏览器下桥不可达的统一文案：含「连接」以命中 NET_FAIL 的 networkish 判据（可重试） */
+const BRIDGE_DOWN = "无法连接本地服务，请确认 HGhub 桌面端已启动";
+
+/** 底层传输：Tauri 走 IPC invoke；浏览器 POST JSON 到本机桥 `/api/{cmd}`。
+ *  桥的信封 {ok,data|error} 与 invoke 的 Ok / Err(String) 语义一一对应，
+ *  因此外层 call() 的错误分类与只读重试在两种模式下共用。
+ *  桥自身不可达（fetch 抛错）映射为 BRIDGE_DOWN。 */
+export function rawCall<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (isTauri) return invoke<T>(cmd, args);
+  return (async () => {
+    let r: Response;
+    try {
+      r = await fetch(`${BRIDGE}/api/${cmd}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(args ?? {}),
+      });
+    } catch {
+      throw new Error(BRIDGE_DOWN);
+    }
+    let payload: { ok?: boolean; data?: T; error?: unknown } | null = null;
+    try { payload = await r.json(); } catch { /* 403/4xx 纯文本，走下方 HTTP 状态分支 */ }
+    if (payload?.ok) return payload.data as T;
+    if (payload && !payload.ok && typeof payload.error === "string" && payload.error) {
+      throw new Error(payload.error);
+    }
+    throw new Error(`HTTP ${r.status}`);
+  })();
+}
 
 /** 网络类失败的样子：没有 HTTP 状态码，纯链路层（DNS / 连接 / 超时 / TLS） */
 const NET_FAIL = /dns|timed? ?out|timeout|connection|refused|reset|unreachable|broken pipe|tls|ssl|handshake|证书|网络|连接/i;
@@ -76,13 +122,14 @@ const failMessage = (msg: string, status?: string) =>
     : msg.length > 140 ? `${msg.slice(0, 140)}…` : msg;
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const once = () => invoke(cmd, args) as Promise<T>;
+  const once = () => rawCall<T>(cmd, args);
   try {
     const r = await once();
     notifyNet({ ok: true, cmd });
     return r;
   } catch (e) {
-    const msg = typeof e === "string" ? e : "请求失败，请检查网络";
+    // invoke 拒绝值是字符串；浏览器模式的 rawCall 抛 Error 对象
+    const msg = typeof e === "string" ? e : e instanceof Error ? e.message : "请求失败，请检查网络";
     const status = /^HTTP (\d{3})\b/.exec(msg)?.[1];
     const networkish = !status && NET_FAIL.test(msg);
     // 落盘完整错误链（dns error / connection refused / 证书错误…），toast 只显示截断版
@@ -101,7 +148,7 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
         notifyNet({ ok: true, cmd });
         return r;
       } catch (e2) {
-        const again = typeof e2 === "string" ? e2 : msg;
+        const again = typeof e2 === "string" ? e2 : e2 instanceof Error ? e2.message : msg;
         const againStatus = /^HTTP (\d{3})\b/.exec(again)?.[1];
         logLine(`[api] ${cmd} 重试仍失败 → ${again}`);
         tracePlayback("api.retry_failed", { cmd, err: again, status: againStatus ?? null });
@@ -165,10 +212,10 @@ export const api = {
   commentSend: (id: number, ep: number, text: string, replyId?: number) =>
     call<unknown>("api_comment_send", { id, ep, text, replyId: replyId ?? null }),
 
-  clearCache: () => invoke<void>("cache_clear"),
-  netDiag: () => invoke<Record<string, unknown>>("net_diag"),
-  postLike: (id: number, on: boolean) => invoke<unknown>("api_post_like", { id, on }),
-  postCollect: (id: number, on: boolean) => invoke<unknown>("api_post_collect", { id, on }),
+  clearCache: () => rawCall<void>("cache_clear"),
+  netDiag: () => rawCall<Record<string, unknown>>("net_diag"),
+  postLike: (id: number, on: boolean) => rawCall<unknown>("api_post_like", { id, on }),
+  postCollect: (id: number, on: boolean) => rawCall<unknown>("api_post_collect", { id, on }),
   postComments: (id: number, page: number, size: number) => call<CommentPage>("api_post_comments", { id, page, size }),
   postCategories: () => call<{ items: PostCategory[] }>("api_post_categories"),
   postCategory: (route: string, page = 1, size = 20) =>
@@ -195,7 +242,9 @@ export const api = {
 
   /* 更新检查：对比 GitHub Release 的 tag */
   checkUpdate: () => call<UpdateInfo>("check_update"),
-  openUrl: (url: string) => call<void>("open_url", { url }),
+  /* 浏览器没有 shell opener：直接开新标签页 */
+  openUrl: (url: string) =>
+    isWeb ? Promise.resolve(void window.open(url, "_blank", "noopener")) : call<void>("open_url", { url }),
 };
 
 /* ── 更新检查 ───────────────────────────────────────────── */

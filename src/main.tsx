@@ -2,7 +2,6 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { AppProvider } from "./store";
-import { invoke } from "@tauri-apps/api/core";
 import "./index.css";
 import { initPlaybackLog, installPlaybackPageEvents, tracePlayback } from "./playbackDiagnostics";
 import { initAutoLine } from "./autoLine";
@@ -29,9 +28,9 @@ tracePlayback("app.env", {
   media_scheme: LOCAL.split(":")[0], screen: `${screen.width}x${screen.height}`,
   dpr: devicePixelRatio, lang: navigator.language,
 });
-/* 运行期错误统一落到 debug.log，便于自查 */
+/* 运行期错误统一落到 debug.log，便于自查（浏览器模式经桥写同一文件） */
 function report(kind: string, msg: string) {
-  invoke("debug_log", { msg: `[${kind}] ${msg}` }).catch(() => {});
+  logLine(`[${kind}] ${msg}`);
   tracePlayback(`app.${kind}`, { detail: msg });
 }
 window.addEventListener("error", (e) => {

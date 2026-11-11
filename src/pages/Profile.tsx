@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, APP_VERSION, fmt, fmtTime, isMobile, platform } from "../api";
+import { api, APP_VERSION, fmt, fmtTime, isMobile, isWeb, platform } from "../api";
 import type { Detail } from "../types";
 import { useStore } from "../store";
 import { Avatar, Empty, Img } from "../components/ui";
@@ -150,7 +150,7 @@ export default function Profile({ wide }: { wide: boolean }) {
           )}
         </div>
 
-        <div className="text-center text-[10px] text-dim mt-5">HGhub {APP_VERSION} · {platform === "android" ? "Android" : platform === "ios" ? "iOS" : platform === "macos" ? "macOS" : "Windows"} 客户端</div>
+        <div className="text-center text-[10px] text-dim mt-5">HGhub {APP_VERSION} · {isWeb ? "Web" : platform === "android" ? "Android" : platform === "ios" ? "iOS" : platform === "macos" ? "macOS" : "Windows"} 客户端</div>
       </div>
     </div>
   );
