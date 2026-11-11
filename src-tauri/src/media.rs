@@ -81,8 +81,7 @@ fn lru_get<V: Clone>(
 
 /// 写缓存；满了就淘汰最久未使用的一条。
 fn lru_put<V>(map: &Mutex<HashMap<String, LruEntry<V>>>, key: String, val: V, max: usize) {
-    let seq = next_seq();
-    let mut m = match map.lock() {
+    let seq = next_seq();    let mut m = match map.lock() {
         Ok(m) => m,
         Err(_) => return,
     };
@@ -108,6 +107,118 @@ fn cache_put<V: Clone>(map: &Mutex<HashMap<String, V>>, key: String, val: V, max
     m.insert(key, val);
 }
 
+/* ───────────────────────── 分片磁盘缓存 ───────────────────────── */
+
+/// 磁盘缓存目录（启动时 [`bind_disk_cache`] 注入；None 表示不启用）。
+static DISK_DIR: Lazy<Mutex<Option<std::path::PathBuf>>> = Lazy::new(|| Mutex::new(None));
+/// 磁盘缓存总量上限。500MB ≈ 240 片，够放十几集的已看片段；
+/// 超限按「最后访问时间」淘汰最旧的（文件 mtime 在读取时刷新）。
+const DISK_CACHE_MAX_BYTES: u64 = 500 * 1024 * 1024;
+/// 单文件大小上限：超过就不落盘（异常大分片不值得占空间）
+const DISK_ENTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// 绑定磁盘缓存目录（应用启动时调用一次）。目录不可写时静默关闭该功能。
+pub fn bind_disk_cache(dir: std::path::PathBuf) {
+    let path = dir.join("segment-cache");
+    if std::fs::create_dir_all(&path).is_err() {
+        return;
+    }
+    if let Ok(mut slot) = DISK_DIR.lock() {
+        *slot = Some(path);
+    }
+}
+
+/// URL → 稳定的文件名。用 FNV-1a 64 位：无需引入哈希库，
+/// 且不把上游 URL（含 auth_key 签名）写进文件名。
+fn disk_key(url: &str) -> String {
+    let hash = url
+        .as_bytes()
+        .iter()
+        .fold(14695981039346656037u64, |h, b| {
+            (h ^ *b as u64).wrapping_mul(1099511628211)
+        });
+    format!("{hash:016x}.seg")
+}
+
+fn disk_path(url: &str) -> Option<std::path::PathBuf> {
+    let dir = DISK_DIR.lock().ok()?.clone()?;
+    Some(dir.join(disk_key(url)))
+}
+
+/// 从磁盘读分片；命中时刷新 mtime（LRU 依据），返回内容与类型。
+fn disk_get(url: &str) -> Option<Arc<Vec<u8>>> {
+    let path = disk_path(url)?;
+    let bytes = std::fs::read(&path).ok()?;
+    // 刷新访问时间，供淘汰时判断「最久没用」
+    let _ = filetime_touch(&path);
+    Some(Arc::new(bytes))
+}
+
+/// 落盘（异步、失败静默）。写临时文件再改名，避免读到半截文件。
+fn disk_put(url: &str, bytes: &Arc<Vec<u8>>) {
+    if bytes.len() > DISK_ENTRY_MAX_BYTES {
+        return;
+    }
+    let Some(path) = disk_path(url) else { return };
+    let bytes = bytes.clone();
+    std::thread::spawn(move || {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, bytes.as_slice()).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        trim_disk_cache();
+    });
+}
+
+fn filetime_touch(path: &std::path::Path) -> std::io::Result<()> {
+    // 用 OpenOptions 以写方式打开并立即关闭，Windows 上会更新最后访问/写入时间；
+    // 不重写内容，避免额外 IO。
+    let file = std::fs::OpenOptions::new().append(true).open(path)?;
+    drop(file);
+    Ok(())
+}
+
+/// 超限时按 mtime 从旧到新删除，直到回到上限以下（保留一半余量避免频繁触发）。
+fn trim_disk_cache() {
+    let Some(dir) = DISK_DIR.lock().ok().and_then(|d| d.clone()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta.modified().ok()?;
+            Some((modified, meta.len(), entry.path()))
+        })
+        .collect();
+    let total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= DISK_CACHE_MAX_BYTES {
+        return;
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    let target = DISK_CACHE_MAX_BYTES / 2;
+    let mut freed = 0u64;
+    for (_, len, path) in files {
+        if total.saturating_sub(freed) <= target {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            freed += len;
+        }
+    }
+}
+
 /* ───────────────────────── 预取 ───────────────────────── */
 
 /// 播放列表 → 分片序列（原始上游地址）。预取靠它判断「当前片后面还有哪些」。
@@ -125,17 +236,47 @@ static PREFETCH_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// 新位置的分片反而没人预取（实测跳转后第 4 片要 7 秒）。
 static PREFETCH_GEN: AtomicU64 = AtomicU64::new(0);
 
-/// 预取领先片数：单连接吞吐约 0.35–0.7MB/s（实测，受 RTT 限制），
-/// 总带宽约 4MB/s 被所有连接平分，所以「并发越高单任务越慢」。
-/// 播放 2–6 秒一片，领先 5 片足以覆盖一次小幅前跳/回看，
-/// 又不会让预取把带宽占满、把前台请求拖慢（实测 8 片 + 4 并发时，
-/// 个别分片反而要 8 秒以上）。
-const PREFETCH_AHEAD: usize = 5;
+/// 预取领先片数：**自适应**。单连接吞吐约 0.35–0.7MB/s（受 RTT 限制），
+/// 总带宽被所有连接平分，所以领先片数要跟着「实测下载速度」走：
+/// - 网络快（单片 < 2s）：领先 10 片，充分覆盖远跳/回看
+/// - 网络一般（2–4s）：领先 5 片，兼顾带宽与覆盖
+/// - 网络差（> 4s）：领先 3 片，别把前台带宽抢光
+/// 依据是最近一次成功下载的耗时（见 [`observe_download_speed`]）。
+const PREFETCH_AHEAD_FAST: usize = 10;
+const PREFETCH_AHEAD_NORMAL: usize = 5;
+const PREFETCH_AHEAD_SLOW: usize = 3;
 /// 预取并发上限：3 路并行 ≈ 1.2 片/秒，跟得上播放节奏，同时给前台留一半带宽。
 const PREFETCH_MAX_INFLIGHT: usize = 3;
-/// 前台未命中分片时的分段并发数。实测 4 路拿到约 2.2× 加速（带宽共享，
-/// 不是线性），再高收益递减且容易被 CDN 风控。
-const RANGED_PARTS: usize = 4;
+/// 前台未命中分片时的分段并发数。
+/// 实测并发扩展（同一 CDN）：1→10.7s、2→6.1s、4→2.65s、**8→1.97s**，
+/// 8 路仍在改善，故取 8；再高收益递减且更容易触发 CDN 风控。
+const RANGED_PARTS: usize = 8;
+/// 最近一次前台分片下载耗时（毫秒），用于自适应领先片数与超时判断。
+/// 0 表示尚无样本。
+static LAST_DOWNLOAD_MS: AtomicU64 = AtomicU64::new(0);
+/// 前台正在下载的分片数。预取看到它 > 0 时主动让路，
+/// 避免「后台预取把带宽占满，前台反而更慢」——实测 3 路预取 + 1 路前台时，
+/// 前台分片耗时会被拉长。
+static FOREGROUND_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// 记录一次前台下载耗时，供预取自适应使用。
+fn observe_download_speed(elapsed: std::time::Duration) {
+    let ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+    // 只采信合理区间，避免异常值（超时重试、0ms 缓存穿透）带偏判断
+    if ms >= 50 && ms <= 60_000 {
+        LAST_DOWNLOAD_MS.store(ms, Ordering::Relaxed);
+    }
+}
+
+/// 当前网络下应领先多少片。
+fn prefetch_ahead() -> usize {
+    match LAST_DOWNLOAD_MS.load(Ordering::Relaxed) {
+        0 => PREFETCH_AHEAD_NORMAL,
+        ms if ms < 2_000 => PREFETCH_AHEAD_FAST,
+        ms if ms < 4_000 => PREFETCH_AHEAD_NORMAL,
+        _ => PREFETCH_AHEAD_SLOW,
+    }
+}
 
 /// 分片级下载锁（singleflight）：同一片同时只允许一次真实下载。
 ///
@@ -320,6 +461,11 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
     let (rewritten, segments) = rewrite_playlist(url, text, prefix);
     // 注册「列表 → 分片序列」与反向索引，供播放时的后台预取定位后继分片
     register_playlist(url, &segments);
+    // 首片预热：播放器拿到 m3u8 后还要发一次分片请求才会出画面，
+    // 单分片 3–5 秒的下载全落在「点了没反应」的观感上。
+    // 这里在返回播放列表的同时就把前两片排进预取队列，
+    // 等 hls.js 真正来取时大概率已经命中缓存 —— 这是「点开就播」的关键。
+    warmup_head(&segments);
     let arc = Arc::new(rewritten);
     cache_put(&PL_CACHE, cache_key, arc.clone(), PL_CACHE_MAX);
     Ok(arc)
@@ -424,10 +570,24 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
         return Ok((Some(ctype), hit));
     }
 
+    // 磁盘缓存：上次播放（甚至上次启动）存过的分片直接读盘，
+    // 省掉 3–5 秒下载。读盘 2.1MB 通常 <10ms，远快于走网络。
+    if let Some(bytes) = disk_get(url) {
+        let stored = store_segment(url, None, bytes.as_ref().clone());
+        drop(_guard);
+        schedule_prefetch(url);
+        return Ok(stored);
+    }
+
     // 分段并发下载：单连接吞吐被 RTT 限制在 0.35–0.7MB/s，一片 2.1MB 要 3–5 秒。
-    // 4 路并发实测约 2.2× 加速，这是「远距离跳转」唯一能压进 2 秒的手段
+    // 8 路并发实测约 1.97s（4 路 2.65s），这是「远距离跳转」唯一能压进 2 秒的手段
     // （预取只能救已缓存区间）。CDN 不支持 Range 时自动退回整包下载。
-    let (ctype, bytes) = fetch_bytes_ranged(url, RANGED_PARTS).await?;
+    let download_started = std::time::Instant::now();
+    FOREGROUND_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    let fetched = fetch_bytes_ranged(url, RANGED_PARTS).await;
+    FOREGROUND_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    let (ctype, bytes) = fetched?;
+    observe_download_speed(download_started.elapsed());
     let stored = store_segment(url, ctype, bytes);
     drop(_guard);
     schedule_prefetch(url);
@@ -456,8 +616,20 @@ fn store_segment(
         cache_put(&KEY_CACHE, url.to_string(), (mime.clone(), arc.clone()), KEY_CACHE_MAX);
     } else if len <= SEG_CACHE_MAX_BYTES {
         lru_put(&SEG_CACHE, url.to_string(), (mime.clone(), arc.clone()), SEG_CACHE_MAX);
+        // 落盘：下次启动（或内存淘汰后）再看同一集就不必重新下载。
+        // 2.1MB 的分片写盘约几毫秒，放在独立线程里，不阻塞本次响应。
+        disk_put(url, &arc);
     }
     (Some(mime), arc)
+}
+
+/// 切集/切片预热：只拉播放列表并排队下载开头分片，不返回内容。
+///
+/// 前端在「相邻集播放地址预热成功」后调用它，切过去时首片往往已经就绪，
+/// 表现为切集秒开而不是黑屏 3–5 秒。
+pub async fn warmup_playlist(url: &str, origin: &str) -> Result<(), String> {
+    // load_playlist 内部已完成 register_playlist + warmup_head
+    load_playlist(url, origin).await.map(|_| ())
 }
 
 /// 后台预取当前分片之后若干片。
@@ -488,7 +660,7 @@ fn schedule_prefetch(current: &str) {
     if start >= segments.len() {
         return;
     }
-    let end = (start + PREFETCH_AHEAD).min(segments.len());
+    let end = (start + prefetch_ahead()).min(segments.len());
 
     // 换代：本次播放位置之后的排队任务才算有效，旧位置的任务自动作废
     let generation = PREFETCH_GEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -532,10 +704,59 @@ fn schedule_prefetch(current: &str) {
     }
 }
 
+/// 首片预热：拿到播放列表后立刻排队下载开头若干片。
+///
+/// 与 [`schedule_prefetch`] 的区别：后者由「已经在下某一分片」触发（播放中追进度），
+/// 前者在**播放还没开始**时就抢先动手，专治「点开视频后 3–5 秒黑屏」。
+/// 只预热前 2 片：再往后就要靠播放中的预取接棒，避免一次性把带宽占满。
+fn warmup_head(segments: &[String]) {
+    if segments.is_empty() {
+        return;
+    }
+    let generation = PREFETCH_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    for segment in segments.iter().take(2) {
+        if SEG_CACHE.lock().is_ok_and(|cache| cache.contains_key(segment)) {
+            continue;
+        }
+        let queued = match PREFETCH_ACTIVE.lock() {
+            Ok(mut active) => {
+                if active.contains(segment) {
+                    true
+                } else {
+                    if active.len() >= 64 {
+                        active.clear();
+                    }
+                    active.insert(segment.clone());
+                    false
+                }
+            }
+            Err(_) => true,
+        };
+        if queued {
+            continue;
+        }
+        PREFETCH_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+        let url = segment.clone();
+        tauri::async_runtime::spawn(async move {
+            prefetch_one(&url, generation).await;
+            PREFETCH_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(mut active) = PREFETCH_ACTIVE.lock() {
+                active.remove(&url);
+            }
+            // 首片下完把后继接上，保证起播后不会「缓冲一次又卡住」
+            schedule_prefetch(&url);
+        });
+    }
+}
+
 /// 单个预取任务：失败静默（前台请求会自己重试，预取只是提前量）。
 async fn prefetch_one(url: &str, generation: u64) {
     // 排到自己时已经换代（用户跳到别的位置了）：直接放弃，把额度让给新位置
     if PREFETCH_GEN.load(Ordering::Relaxed) != generation {
+        return;
+    }
+    // 前台正在下载：预取让路。后台多占一路，前台就要多等一截。
+    if FOREGROUND_ACTIVE.load(Ordering::Relaxed) > 0 {
         return;
     }
     if SEG_CACHE.lock().is_ok_and(|cache| cache.contains_key(url)) {
@@ -554,7 +775,21 @@ async fn prefetch_one(url: &str, generation: u64) {
         return;
     }
     let started = std::time::Instant::now();
-    match fetch_bytes(url).await {
+    // 首片预热（generation 最新且是播放列表开头两片）走分段并发：
+    // 它是用户「点开就播」的唯一等待路径，值得用满带宽。
+    // 普通追进度预取仍走整包，避免后台把连接池和带宽摊薄。
+    let is_head = PREFETCH_GEN.load(Ordering::Relaxed) == generation
+        && SEG_OWNER
+            .lock()
+            .ok()
+            .and_then(|owner| owner.get(url).map(|(_, index)| *index < 2))
+            .unwrap_or(false);
+    let fetched = if is_head {
+        fetch_bytes_ranged(url, RANGED_PARTS).await
+    } else {
+        fetch_bytes(url).await
+    };
+    match fetched {
         Ok((ctype, bytes)) => {
             let len = bytes.len();
             store_segment(url, ctype, bytes);
@@ -601,6 +836,14 @@ pub fn clear_caches() {
     }
     if let Ok(mut g) = PREFETCH_ACTIVE.lock() {
         g.clear();
+    }
+    // 磁盘缓存也一起清（「清除缓存」按钮的语义是全部清掉）
+    if let Some(dir) = DISK_DIR.lock().ok().and_then(|d| d.clone()) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -704,7 +947,13 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
         "/seg" => match load_segment(&target).await {
-            Ok((ctype, bytes)) => segment_response(&target, ctype.as_deref(), bytes.as_ref().clone(), origin),
+            Ok((ctype, bytes)) => {
+                // 未命中路径上这个 Arc 的引用计数是 1（刚建好、还没进缓存），
+                // try_unwrap 能零拷贝取出 Vec，省掉一次 2.1MB memcpy；
+                // 命中时计数 >1（缓存持有一份），只能 clone，这是必须的。
+                let body = Arc::try_unwrap(bytes).unwrap_or_else(|arc| (*arc).clone());
+                segment_response(&target, ctype.as_deref(), body, origin)
+            }
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
         _ => respond(404, "text/plain", b"not found".to_vec(), "no-store"),

@@ -213,6 +213,8 @@ export const api = {
     call<unknown>("api_comment_send", { id, ep, text, replyId: replyId ?? null }),
 
   clearCache: () => rawCall<void>("cache_clear"),
+  /** 预热某集首片（切集前调用，让切换时不再等下载）；失败静默，仅加速 */
+  mediaWarmup: (url: string) => rawCall<boolean>("media_warmup", { url }).catch(() => false),
   netDiag: () => rawCall<Record<string, unknown>>("net_diag"),
   postLike: (id: number, on: boolean) => rawCall<unknown>("api_post_like", { id, on }),
   postCollect: (id: number, on: boolean) => rawCall<unknown>("api_post_collect", { id, on }),

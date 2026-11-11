@@ -232,6 +232,7 @@ async fn dispatch(app: &tauri::AppHandle, cmd: &str, args: &Value) -> Result<Val
         "debug_log" => api::debug_log(app.clone(), str_arg(args, "msg")?).await.map(|_| Value::Null),
         "net_diag" => api::net_diag().await,
         "cache_clear" => api::cache_clear().await.map(|_| Value::Null),
+        "media_warmup" => api::media_warmup(str_arg(args, "url")?).await.map(Value::Bool),
         /* 线路（数据源） */
         "line_state" => api::line_state().await,
         "line_set" => api::line_set(app.state::<Api>(), str_arg(args, "url")?).await.map(Value::String),

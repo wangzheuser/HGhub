@@ -374,7 +374,12 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         .then((info) => {
           const u = info?.streams?.main || info?.video_url;
           const h = info?.streams?.hevc || info?.video_url_hevc || "";
-          if (u) setPlayUrls((m) => ({ ...m, [k]: u }));
+          if (u) {
+            setPlayUrls((m) => ({ ...m, [k]: u }));
+            // 拿到地址后顺手预热首片：只预取地址的话，切集仍要等 3–5 秒下载首片，
+            // 观感上还是「切过去黑屏一下」。这里把分片也提前拉起来。
+            void api.mediaWarmup(u);
+          }
           if (h) setHevcUrls((m) => ({ ...m, [k]: h }));
         })
         .catch(() => { /* 预热失败不影响当前播放 */ });

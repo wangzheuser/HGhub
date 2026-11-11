@@ -139,7 +139,9 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         nudgeMaxRetry: 6,
         manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 4,
-        fragLoadingTimeOut: 25000,
+        // 15s 而非 25s：实测单分片可能因网络抖动到 10s+，但超过 15s 基本是链路
+        // 已经坏了。早点判超时重试，比干等 25s 后才发现「卡住了」体验更好。
+        fragLoadingTimeOut: 15000,
         fragLoadingMaxRetry: 6,
         fragLoadingRetryDelay: 400,
         // 跳转后允许在目标附近多找一点：分片是 2–6 秒一片，容差太小会

@@ -829,6 +829,16 @@ pub async fn cache_clear() -> Result<(), String> {
     Ok(())
 }
 
+/// 预热某集的首片（切集前调用，让切换时不再等下载）。
+/// 失败静默：预热只是加速，不影响正常播放路径。
+#[tauri::command]
+pub async fn media_warmup(url: String) -> Result<bool, String> {
+    match crate::media::warmup_playlist(&url, crate::media::LOCAL_ORIGIN).await {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 /* ───────────────────────── 吃瓜帖子互动 ───────────────────────── */
 
 #[tauri::command]

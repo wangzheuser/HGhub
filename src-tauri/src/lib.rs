@@ -84,6 +84,8 @@ pub fn run() {
                 // 上次选择的线路（设置 → 线路）在启动时恢复
                 net::bind_base(&dir);
                 playback_log::bind(&dir);
+                // 分片磁盘缓存：二次观看同一集不必重新下载（上限 500MB，LRU 淘汰）
+                media::bind_disk_cache(dir.clone());
                 let state: tauri::State<Api> = app.state();
                 state.session.bind(dir);
             }
@@ -203,6 +205,7 @@ pub fn run() {
             api::api_search,
             api::api_search_hot,
             api::cache_clear,
+            api::media_warmup,
             api::api_posts,
             api::api_post,
             api::api_post_playback,

@@ -90,7 +90,7 @@ export default function Player({
         nudgeMaxRetry: 6,
         manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 4,
-        fragLoadingTimeOut: 25000,
+        fragLoadingTimeOut: 15000,
         fragLoadingMaxRetry: 6,
         fragLoadingRetryDelay: 400,
         maxFragLookUpTolerance: 0.25,
