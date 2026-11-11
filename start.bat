@@ -1,81 +1,88 @@
 @echo off
+chcp 65001 >nul
 setlocal
 title HGhub dev
 
 cd /d "%~dp0"
 
 set "APPLOG=%APPDATA%\com.hghub.huangguo\debug.log"
-
-echo ==================================================
-echo  HGhub ¿ª·¢Ä£Ê½Æô¶¯ (Tauri 2 + Vite + Rust)
-echo ==================================================
-echo.
-echo  [±¾»ú·ÃÎÊµØÖ·]
-echo    Ç°¶Ë dev server     http://localhost:1420
-echo    ä¯ÀÀÆ÷·ÃÎÊ          http://localhost:1420  (Óë×ÀÃæ´°¿Ú¹²ÓÃºó¶Ë)
-echo    ¾ÖÓòÍø·ÃÎÊ          http://%LANIP%:17650  (ÊÖ»ú/ÆäËûµçÄÔ ¾ù¿É)
-echo    [ÌáÊ¾] ¾ÖÓòÍøÉè±¸ Ê×´Î·ÃÎÊÊ± Windows »áµ¯·ÃÎÊÊÚÈ¨£¬Ñ¡¡¸ÔÊĞí¡¹¼´¿É¡£
-echo    ±¾»úÇÅ API/Ã½Ìå      http://127.0.0.1:17650
-echo    Ã½Ìå´úÀí-·âÃæ½âÃÜ   http://hg.localhost/img?u=...
-echo    Ã½Ìå´úÀí-²¥·ÅÁĞ±í   http://hg.localhost/hls?u=...
-echo    Ã½Ìå´úÀí-·ÖÆ¬Í¸´«   http://hg.localhost/seg?u=...
-echo    Ó¦ÓÃÈÕÖ¾            %APPLOG%
-echo.
-echo  [ÉÏÓÎ·ÃÎÊµØÖ· - Êµ¼ÊÏßÂ·ÓÉÓ¦ÓÃ×Ô¶¯Ñ¡Ïß¾ö¶¨]
-echo    Ä¬ÈÏ API ÏßÂ·       https://huangguoai.com
-echo    ±¸ÓÃ API ÏßÂ·       https://huangguoai.ai
-echo    µØÖ··¢²¼Ò³          https://huangguoai.pages.dev/publish.js
-echo    ¶¯Ì¬¾µÏñÊ¾Àı        https://thu.adihsppe.cc  (×ÓÓòËæ»ú)
-echo    Í¼Æ¬ CDN            https://pic.drleao.cn
-echo    ÊÓÆµ/ÃÜÔ¿ CDN       https://tp*.drleao.cn  https://yd-lphu-*.hzjvlo.cn
-echo    ¸üĞÂ¼ì²é            https://api.github.com/repos/zxsos/HGhub/releases
-echo.
-echo  [ËµÃ÷] ²¥·ÅÓëÑ¡ÏßµÄÊµÊ± URL ÓÉÏÂ·½×îĞ¡»¯µÄ HGhub-debug-log
-echo         ´°¿ÚÊä³ö£¨play / hls / seg / line ¸÷ĞĞ£©£»¹Ø±ÕÖ÷´°¿Úºó
-echo         ¸ÃÈÕÖ¾´°¿ÚĞèÊÖ¶¯¹Ø±Õ¡£
-echo.
-
-rem ¾ÖÓòÍø IP ¼ì²â
-powershell -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -NotLike 127.* | Where-Object IPAddress -NotLike 169.254.* | Sort-Object { if ($_.IPAddress -like 192.168.*) { 0 } elseif ($_.IPAddress -like 10.* -or $_.IPAddress -like 172.*) { 1 } else { 2 } } | Select-Object -First 1).IPAddress | Out-File -Encoding ascii temp_lanip.txt"
+rem å±€åŸŸç½‘ IP æ£€æµ‹ï¼ˆ192.168 ä¼˜å…ˆï¼›é€šé…ç¬¦å¿…é¡»å¸¦å¼•å·ï¼Œå¦åˆ™ PowerShell è„šæœ¬å—å†…è§£ææŠ¥é”™ï¼‰
+powershell -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -NotLike '127.*' | Where-Object IPAddress -NotLike '169.254.*' | Sort-Object { if ($_.IPAddress -like '192.168.*') { 0 } elseif ($_.IPAddress -like '10.*' -or $_.IPAddress -like '172.*') { 1 } else { 2 } } | Select-Object -First 1).IPAddress | Out-File -Encoding ascii temp_lanip.txt"
 set /p LANIP=<temp_lanip.txt
 del temp_lanip.txt 2>nul
-if not defined LANIP set LANIP=Î´¼ì²âµ½
+if not defined LANIP set "LANIP=æœªæ£€æµ‹åˆ°"
+
+
+echo ==================================================
+echo  HGhub å¼€å‘æ¨¡å¼å¯åŠ¨ (Tauri 2 + Vite + Rust)
+echo ==================================================
+echo.
+echo  [æœ¬æœºè®¿é—®åœ°å€]
+echo    å‰ç«¯ dev server     http://localhost:1420
+echo    æµè§ˆå™¨è®¿é—®          http://localhost:1420  (ä¸æ¡Œé¢çª—å£å…±ç”¨åç«¯)
+echo    å±€åŸŸç½‘è®¿é—®          http://%LANIP%:17650  (æ‰‹æœº/å…¶ä»–ç”µè„‘ å‡å¯)
+echo    [æç¤º] å±€åŸŸç½‘è®¾å¤‡ é¦–æ¬¡è®¿é—®æ—¶ Windows ä¼šå¼¹è®¿é—®æˆæƒï¼Œé€‰ã€Œå…è®¸ã€å³å¯ã€‚
+echo    æœ¬æœºæ¡¥ API/åª’ä½“      http://127.0.0.1:17650
+echo    åª’ä½“ä»£ç†-å°é¢è§£å¯†   http://hg.localhost/img?u=...
+echo    åª’ä½“ä»£ç†-æ’­æ”¾åˆ—è¡¨   http://hg.localhost/hls?u=...
+echo    åª’ä½“ä»£ç†-åˆ†ç‰‡é€ä¼    http://hg.localhost/seg?u=...
+echo    åº”ç”¨æ—¥å¿—            %APPLOG%
+echo.
+echo  [ä¸Šæ¸¸è®¿é—®åœ°å€ - å®é™…çº¿è·¯ç”±åº”ç”¨è‡ªåŠ¨é€‰çº¿å†³å®š]
+echo    é»˜è®¤ API çº¿è·¯       https://huangguoai.com
+echo    å¤‡ç”¨ API çº¿è·¯       https://huangguoai.ai
+echo    åœ°å€å‘å¸ƒé¡µ          https://huangguoai.pages.dev/publish.js
+echo    åŠ¨æ€é•œåƒç¤ºä¾‹        https://thu.adihsppe.cc  (å­åŸŸéšæœº)
+echo    å›¾ç‰‡ CDN            https://pic.drleao.cn
+echo    è§†é¢‘/å¯†é’¥ CDN       https://tp*.drleao.cn  https://yd-lphu-*.hzjvlo.cn
+echo    æ›´æ–°æ£€æŸ¥            https://api.github.com/repos/zxsos/HGhub/releases
+echo.
+echo  [è¯´æ˜] æ’­æ”¾ä¸é€‰çº¿çš„å®æ—¶ URL ç”±ä¸‹æ–¹æœ€å°åŒ–çš„ HGhub-debug-log
+echo         çª—å£è¾“å‡ºï¼ˆplay / hls / seg / line å„è¡Œï¼‰ï¼›å…³é—­ä¸»çª—å£å
+echo         è¯¥æ—¥å¿—çª—å£éœ€æ‰‹åŠ¨å…³é—­ã€‚
+echo.
+
+rem å±€åŸŸç½‘ IP æ£€æµ‹ï¼ˆ192.168 ä¼˜å…ˆï¼›é€šé…ç¬¦å¿…é¡»å¸¦å¼•å·ï¼Œå¦åˆ™ PowerShell è„šæœ¬å—å†…è§£ææŠ¥é”™ï¼‰
+powershell -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -NotLike '127.*' | Where-Object IPAddress -NotLike '169.254.*' | Sort-Object { if ($_.IPAddress -like '192.168.*') { 0 } elseif ($_.IPAddress -like '10.*' -or $_.IPAddress -like '172.*') { 1 } else { 2 } } | Select-Object -First 1).IPAddress | Out-File -Encoding ascii temp_lanip.txt"
+set /p LANIP=<temp_lanip.txt
+del temp_lanip.txt 2>nul
+if not defined LANIP set "LANIP=æœªæ£€æµ‹åˆ°"
 netstat -ano | findstr /C:":1420 " | findstr "LISTENING" >nul 2>&1
 if %errorlevel%==0 (
-    echo [warn] ¶Ë¿Ú 1420 ÒÑ±»Õ¼ÓÃ£¬¿ÉÄÜÒÑÓĞ HGhub dev ÊµÀıÔÚÔËĞĞ¡£
-    echo        ÇëÏÈ¹Ø±ÕÏÖÓĞÊµÀı»òÆä vite ½ø³Ì£¬ÔÙÔËĞĞ±¾½Å±¾¡£
+    echo [warn] ç«¯å£ 1420 å·²è¢«å ç”¨ï¼Œå¯èƒ½å·²æœ‰ HGhub dev å®ä¾‹åœ¨è¿è¡Œã€‚
+    echo        è¯·å…ˆå…³é—­ç°æœ‰å®ä¾‹æˆ–å…¶ vite è¿›ç¨‹ï¼Œå†è¿è¡Œæœ¬è„šæœ¬ã€‚
     echo.
     pause
     exit /b 1
 )
 
 if not exist node_modules (
-    echo [setup] node_modules ²»´æÔÚ£¬ÕıÔÚ°²×°ÒÀÀµ£¨Ê×´Î½ÏÂı£©...
+    echo [setup] node_modules ä¸å­˜åœ¨ï¼Œæ­£åœ¨å®‰è£…ä¾èµ–ï¼ˆé¦–æ¬¡è¾ƒæ…¢ï¼‰...
     call pnpm install
     if errorlevel 1 (
-        echo [error] ÒÀÀµ°²×°Ê§°Ü£¬Çë¼ì²éÍøÂç»ò Node/pnpm »·¾³¡£
+        echo [error] ä¾èµ–å®‰è£…å¤±è´¥ï¼Œè¯·æ£€æŸ¥ç½‘ç»œæˆ– Node/pnpm ç¯å¢ƒã€‚
         pause
         exit /b 1
     )
 )
 
-rem ±àÂëËµÃ÷: ±¾ÎÄ¼ş±ØĞë±£´æÎª ANSI/GBK£¬cmd Ô­Éú´úÂëÒ³½âÎö; UTF-8 »áµ¼ÖÂ chcp ºó×Ö½ÚÆ«ÒÆ´íÎ»
-rem ¶ÀÁ¢´°¿ÚÊµÊ±¸ú×ÙÓ¦ÓÃÈÕÖ¾£ºÊä³öËùÓĞ play / hls / seg / line ·ÃÎÊ URL
+rem ç¼–ç è¯´æ˜: æœ¬æ–‡ä»¶ä¿å­˜ä¸º UTF-8ï¼ˆæ—  BOMï¼‰ï¼Œç¬¬ 2 è¡Œ chcp 65001 åˆ‡æ¢æ§åˆ¶å°ä»£ç é¡µï¼›å‹¿åˆ  chcp è¡Œï¼Œå¦åˆ™ä¸­æ–‡ä¹±ç 
+rem ç‹¬ç«‹çª—å£å®æ—¶è·Ÿè¸ªåº”ç”¨æ—¥å¿—ï¼šè¾“å‡ºæ‰€æœ‰ play / hls / seg / line è®¿é—® URL
 start "HGhub-debug-log" /min powershell -NoProfile -Command "while(-not (Test-Path '%APPLOG%')){ Start-Sleep -Milliseconds 500 }; Get-Content '%APPLOG%' -Wait -Tail 50"
 
 if not exist dist (
-    echo [setup] Î´ÕÒµ½ dist ²úÎï£¬ÕıÔÚÎªÒ³ÃæÈë¿Ú¹¹½¨¡­¡­
+    echo [setup] æœªæ‰¾åˆ° dist äº§ç‰©ï¼Œæ­£åœ¨ä¸ºé¡µé¢å…¥å£æ„å»ºâ€¦â€¦
     call pnpm build
     if errorlevel 1 (
-        echo [error] ¹¹½¨Ê§°Ü£¬Çë¼ì²é»·¾³
+        echo [error] æ„å»ºå¤±è´¥ï¼Œè¯·æ£€æŸ¥ç¯å¢ƒ
         pause
         exit /b 1
     )
 )
-echo [run] pnpm app:dev  £¨¹Ø±ÕÓ¦ÓÃ´°¿Ú¼´ÍË³ö£»Ctrl+C ¿ÉÖĞ¶Ï£©
+echo [run] pnpm app:dev  ï¼ˆå…³é—­åº”ç”¨çª—å£å³é€€å‡ºï¼›Ctrl+C å¯ä¸­æ–­ï¼‰
 call pnpm app:dev
 
 echo.
-echo [exit] HGhub dev ÒÑÍË³ö¡£
+echo [exit] HGhub dev å·²é€€å‡ºã€‚
 pause
 endlocal
