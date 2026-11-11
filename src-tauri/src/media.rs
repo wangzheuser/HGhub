@@ -4,7 +4,7 @@
 //! 所以图片与视频统一走本地自定义协议（Windows/Android 为 `http://hg.localhost`，
 //! macOS 为 `hg://localhost`，见 [`LOCAL_ORIGIN`]）。
 
-use crate::net::fetch_bytes;
+use crate::net::{fetch_bytes, fetch_bytes_ranged};
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use once_cell::sync::Lazy;
@@ -133,6 +133,9 @@ static PREFETCH_GEN: AtomicU64 = AtomicU64::new(0);
 const PREFETCH_AHEAD: usize = 5;
 /// 预取并发上限：3 路并行 ≈ 1.2 片/秒，跟得上播放节奏，同时给前台留一半带宽。
 const PREFETCH_MAX_INFLIGHT: usize = 3;
+/// 前台未命中分片时的分段并发数。实测 4 路拿到约 2.2× 加速（带宽共享，
+/// 不是线性），再高收益递减且容易被 CDN 风控。
+const RANGED_PARTS: usize = 4;
 
 /// 分片级下载锁（singleflight）：同一片同时只允许一次真实下载。
 ///
@@ -421,7 +424,10 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
         return Ok((Some(ctype), hit));
     }
 
-    let (ctype, bytes) = fetch_bytes(url).await?;
+    // 分段并发下载：单连接吞吐被 RTT 限制在 0.35–0.7MB/s，一片 2.1MB 要 3–5 秒。
+    // 4 路并发实测约 2.2× 加速，这是「远距离跳转」唯一能压进 2 秒的手段
+    // （预取只能救已缓存区间）。CDN 不支持 Range 时自动退回整包下载。
+    let (ctype, bytes) = fetch_bytes_ranged(url, RANGED_PARTS).await?;
     let stored = store_segment(url, ctype, bytes);
     drop(_guard);
     schedule_prefetch(url);

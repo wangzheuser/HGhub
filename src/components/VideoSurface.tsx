@@ -128,9 +128,12 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         // Prefer standard MSE on macOS; hls.js handles MMS-only fallback and seek recovery.
         preferManagedMediaSource: false,
         autoStartLoad: false,
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        backBufferLength: 30,
+        // 缓冲窗口调大：桥侧单分片下载 3–5 秒（受 RTT 限制），缓冲区太薄时
+        // 一旦预取没跟上就会卡在「等待下一片」。60 秒窗口 = 约 10–15 片余量，
+        // 足够覆盖一次远距离跳转的补片时间；backBuffer 同值让回看不必重下。
+        maxBufferLength: 60,
+        maxMaxBufferLength: 120,
+        backBufferLength: 60,
         maxBufferHole: 0.5,
         nudgeOffset: 0.25,
         nudgeMaxRetry: 6,
@@ -139,6 +142,9 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         fragLoadingTimeOut: 25000,
         fragLoadingMaxRetry: 6,
         fragLoadingRetryDelay: 400,
+        // 跳转后允许在目标附近多找一点：分片是 2–6 秒一片，容差太小会
+        // 落到更远的分片上，反而多等一片的下载时间。
+        maxFragLookUpTolerance: 0.25,
       });
       hlsRef.current = hls;
       observeHls(hls, trace);

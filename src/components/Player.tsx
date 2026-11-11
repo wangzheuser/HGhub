@@ -81,9 +81,10 @@ export default function Player({
         preferManagedMediaSource: false,
         autoStartLoad: false,
         lowLatencyMode: false,
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        backBufferLength: 30,
+        // 与 VideoSurface 保持一致：桥侧单分片 3–5 秒，60 秒窗口才有足够余量
+        maxBufferLength: 60,
+        maxMaxBufferLength: 120,
+        backBufferLength: 60,
         maxBufferHole: 0.5,
         nudgeOffset: 0.25,
         nudgeMaxRetry: 6,
@@ -92,6 +93,7 @@ export default function Player({
         fragLoadingTimeOut: 25000,
         fragLoadingMaxRetry: 6,
         fragLoadingRetryDelay: 400,
+        maxFragLookUpTolerance: 0.25,
       });
       hlsRef.current = hls;
       observeHls(hls, trace);

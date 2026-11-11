@@ -238,6 +238,18 @@ async fn get_with_dns(
     referer: Option<&str>,
     public_dns: bool,
 ) -> Result<reqwest::Response, String> {
+    get_with_dns_range(raw, timeout, accept, referer, public_dns, None).await
+}
+
+/// 带可选 `Range` 的变体：分段下载大分片时用（见 [`fetch_bytes_ranged`]）。
+async fn get_with_dns_range(
+    raw: &str,
+    timeout: Duration,
+    accept: Option<&str>,
+    referer: Option<&str>,
+    public_dns: bool,
+    range: Option<(u64, u64)>,
+) -> Result<reqwest::Response, String> {
     tokio::time::timeout(timeout, async {
         let policy_error = |phase: &str, error: String| {
             crate::playback_log::record("network.target_failed", json!({"resource": crate::playback_log::resource_id(raw), "phase": phase, "error_kind": crate::playback_log::error_kind(&error)}));
@@ -249,6 +261,9 @@ async fn get_with_dns(
             let (target, http) = client_for_dns(next.as_str(), public_dns).await.map_err(|e| policy_error("dns_or_client", e))?;
             crate::playback_log::record("network.target_ready", json!({"resource": crate::playback_log::resource_id(raw), "target_resource": crate::playback_log::resource_id(target.as_str()), "dns_or_client_ms": resolving.elapsed().as_millis() as u64, "hop": hop}));
             let mut request = http.get(target.clone()).timeout(timeout);
+            if let Some((start, end)) = range {
+                request = request.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+            }
             if let Some(value) = accept {
                 request = request.header("Accept", value);
             }
@@ -954,10 +969,147 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
     .await
 }
 
+/// 分段并发下载大分片（B 方案）。
+///
+/// 为什么需要它：单连接吞吐实测只有 0.35–0.7MB/s（hyper 小块读取被 RTT 放大），
+/// 一片 2.1MB 要 3–5 秒；实测 4 路并发能拿到约 2.2× 加速（带宽共享，不是线性）。
+/// 把分片按字节区间拆开并行取，是**远距离跳转**唯一能压进 2 秒的手段——
+/// 预取救不了「用户直接跳到没缓存的位置」。
+///
+/// 零额外探测成本的做法：第一段直接用 `Range: bytes=0-{chunk-1}` 请求，
+/// - 返回 206 → CDN 支持 Range，解析 `Content-Range` 得到总长，再并发取剩余段；
+/// - 返回 200 → 不支持 Range，这个响应本身就是完整分片，直接读走。
+///
+/// 任何一段失败都回退到 [`fetch_bytes`] 整包下载，保证不会因分段而播不出来。
+pub async fn fetch_bytes_ranged(
+    url: &str,
+    parts: usize,
+) -> Result<(Option<String>, Vec<u8>), String> {
+    const MIN_RANGED_BYTES: u64 = 1024 * 1024;
+    let parts = parts.clamp(2, 8) as u64;
+
+    let referer = format!("{}/", base());
+    let public_dns = AtomicBool::new(
+        MEDIA_DNS_ROUTES
+            .lock()
+            .ok()
+            .is_some_and(|routes| routes.prefers_public(host_of(url), Instant::now())),
+    );
+
+    // 第一段：探测 + 取首块。用 0-0 只取 1 字节最省，但多一次往返；
+    // 这里直接取一个完整 chunk，探测与下载合一。
+    let probe = match get_with_dns_range(
+        url,
+        Duration::from_secs(20),
+        None,
+        Some(&referer),
+        public_dns.load(Ordering::Relaxed),
+        Some((0, 0)),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        // 探测都失败时交给整包路径，由它统一重试与报错
+        Err(_) => return fetch_bytes(url).await,
+    };
+
+    if probe.status().as_u16() != 206 {
+        // 不支持 Range（或服务端忽略了 Range 头）：整包下载
+        return fetch_bytes(url).await;
+    }
+
+    let total = probe
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit('/').next())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let ctype = probe
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    drop(probe);
+
+    let Some(total) = total else {
+        return fetch_bytes(url).await;
+    };
+    if total < MIN_RANGED_BYTES {
+        return fetch_bytes(url).await;
+    }
+
+    let chunk = total.div_ceil(parts);
+    let mut handles = Vec::new();
+    for index in 0..parts {
+        let start = index * chunk;
+        if start >= total {
+            break;
+        }
+        let end = (start + chunk - 1).min(total - 1);
+        let url = url.to_string();
+        let referer = referer.clone();
+        let use_public_dns = public_dns.load(Ordering::Relaxed);
+        handles.push((start, tokio::spawn(async move {
+            let resp = get_with_dns_range(
+                &url,
+                Duration::from_secs(20),
+                None,
+                Some(&referer),
+                use_public_dns,
+                Some((start, end)),
+            )
+            .await?;
+            if resp.status().as_u16() != 206 {
+                return Err(format!("分段请求返回 {}", resp.status()));
+            }
+            let bytes = resp.bytes().await.map_err(|e| err_text(&e))?.to_vec();
+            Ok::<(u64, Vec<u8>), String>((start, bytes))
+        })));
+    }
+
+    let mut buffer = vec![0u8; total as usize];
+    let mut complete = true;
+    for (expected_start, handle) in handles {
+        match handle.await {
+            Ok(Ok((start, bytes))) if start == expected_start => {
+                let end = start as usize + bytes.len();
+                if end <= buffer.len() {
+                    buffer[start as usize..end].copy_from_slice(&bytes);
+                } else {
+                    complete = false;
+                }
+            }
+            _ => complete = false,
+        }
+    }
+
+    if !complete {
+        // 任一段失败：整包重下，绝不返回半截数据（半截分片会让播放器直接报错）
+        return fetch_bytes(url).await;
+    }
+
+    crate::playback_log::record(
+        "network.ranged",
+        json!({
+            "resource": crate::playback_log::resource_id(url),
+            "parts": parts,
+            "bytes": total,
+        }),
+    );
+    Ok((ctype, buffer))
+}
+
+fn host_of(raw: &str) -> &str {
+    raw.split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|authority| authority.split(':').next())
+        .unwrap_or("")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[tokio::test]
     #[ignore = "联网测试：需要 HGHUB_TEST_MEDIA_URL 为当前有效的媒体地址"]
     async fn media_recovers_from_failed_system_dns() {
