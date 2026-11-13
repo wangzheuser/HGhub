@@ -156,59 +156,175 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
         .map_err(|_| "无法创建 HTTP 客户端".to_string())
 }
 
+/// DNS 复检间隔。到点后由后台任务重新解析并按结果决定是否重建客户端；
+/// 客户端与连接池本身长存，不再像旧版那样每 30 秒整体重建
+/// （实测温热连接池能为 8 路分段下载省 ~1.3s 的握手+慢启动）。
 const CLIENT_TTL: Duration = Duration::from_secs(30);
-type ClientCache = HashMap<String, (Instant, Arc<reqwest::Client>)>;
+
+/// 温热客户端条目：固定构建时通过策略校验的 DNS 地址，连接池长存。
+struct ClientEntry {
+    http: Arc<reqwest::Client>,
+    /// 构建客户端时用的主机名（复检后重建客户端需要）
+    host: String,
+    /// 构建时通过策略校验并固定的地址（非严格模式为空）
+    addrs: Vec<SocketAddr>,
+    /// 上次成功校验（构建或复检答案一致）的时刻
+    #[allow(dead_code)]
+    validated_at: Instant,
+    /// 下次允许复检的时刻
+    next_check_at: Instant,
+    /// 后台复检任务进行中（防止同一主机重复排队）
+    revalidating: bool,
+}
+type ClientCache = HashMap<String, ClientEntry>;
 static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static MEDIA_DNS_ROUTES: Lazy<Mutex<crate::media_dns::Routes>> =
     Lazy::new(|| Mutex::new(crate::media_dns::Routes::default()));
 
-fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<reqwest::Client>> {
-    cache
-        .get(key)
-        .filter(|(expires, _)| now < *expires)
-        .map(|(_, http)| http.clone())
+/// 复检时解析地址（与首次构建同一套校验路径）。
+/// 非严格模式没有固定地址可复检，返回空列表。
+async fn resolve_addrs(
+    target: &url::Url,
+    public_dns: bool,
+    strict: bool,
+) -> Result<(Vec<SocketAddr>, Duration), String> {
+    if public_dns {
+        let resolver = build_client(crate::media_dns::HOST, &crate::media_dns::BOOTSTRAP)?;
+        let host = target.host_str().ok_or("目标缺少主机名")?;
+        let port = target.port_or_known_default().ok_or("目标端口无效")?;
+        let resolution = crate::media_dns::resolve(&resolver, host, port).await?;
+        network_policy::check_addresses_with_mode(&resolution.addresses, strict)?;
+        Ok((resolution.addresses, CLIENT_TTL.min(resolution.ttl)))
+    } else if strict {
+        Ok((
+            network_policy::resolve_target(target, strict).await?,
+            CLIENT_TTL,
+        ))
+    } else {
+        Ok((Vec::new(), CLIENT_TTL))
+    }
 }
 
-/// 缓存按模式、主机和端口隔离；有效期内仅复用已经检查并固定地址的客户端。
-/// 到期后重新检查全部 DNS 答案，不使用旧连接绕过新的目标检查。
+/// 地址序列是否等价（DNS 答案顺序不稳定，排序去重后比较）。
+fn same_addresses(a: &[SocketAddr], b: &[SocketAddr]) -> bool {
+    let mut left: Vec<SocketAddr> = a.to_vec();
+    let mut right: Vec<SocketAddr> = b.to_vec();
+    left.sort();
+    right.sort();
+    left == right
+}
+
+/// 复检结果落地。返回 true 表示客户端被重建（连接池随之更换）。
+///
+/// 安全语义：只有复检产出且通过策略校验的新地址才会替换旧固定地址；
+/// 复检失败时保留旧客户端——它的地址仍是构建时校验过的，不跟随未知答案。
+#[cfg_attr(not(test), allow(dead_code))]
+fn apply_revalidation(
+    entry: &mut ClientEntry,
+    result: Result<(Vec<SocketAddr>, Duration), String>,
+    now: Instant,
+) -> bool {
+    entry.revalidating = false;
+    match result {
+        Ok((addrs, ttl)) => {
+            if same_addresses(&addrs, &entry.addrs) {
+                entry.next_check_at = now + ttl;
+                false
+            } else {
+                match build_client(&entry.host, &addrs) {
+                    Ok(http) => {
+                        entry.http = Arc::new(http);
+                        entry.addrs = addrs;
+                        entry.next_check_at = now + ttl;
+                        true
+                    }
+                    Err(_) => {
+                        entry.next_check_at = now + CLIENT_TTL;
+                        false
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            entry.next_check_at = now + CLIENT_TTL;
+            false
+        }
+    }
+}
+
+/// 到复检点后由后台任务重新解析；期间请求继续使用旧客户端（地址是构建时校验过的）。
+fn spawn_revalidation(key: String, target: url::Url, public_dns: bool, strict: bool) {
+    tauri::async_runtime::spawn(async move {
+        let result = resolve_addrs(&target, public_dns, strict).await;
+        let now = Instant::now();
+        if let Ok(mut cache) = CLIENTS.lock() {
+            // 复检期间条目可能被 refresh_client() 清掉；没了就直接丢弃结果
+            if let Some(entry) = cache.get_mut(&key) {
+                apply_revalidation(entry, result, now);
+            }
+        }
+    });
+}
+
+/// 缓存按模式、主机和端口隔离；客户端固定已通过策略校验的地址。
+/// 到复检点后由后台任务重新解析：
+/// - 答案与已固定地址一致 → 保留客户端与连接池（省 8 条 TLS 连接的握手+慢启动）
+/// - 出现新的合法答案 → 重建客户端并更换固定地址；旧连接池随最后一个引用释放
+/// - 复检失败（含解析出被策略拒绝的地址）→ 保留旧客户端，按 30s 节奏重试
+/// 系统代理变化不再依赖周期重建，沿用错误触发的 [`heal_client`] 重建路径。
 async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
     client_for_dns(raw, false).await
 }
 
-async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<reqwest::Client>), String> {
+async fn client_for_dns(
+    raw: &str,
+    public_dns: bool,
+) -> Result<(url::Url, Arc<reqwest::Client>), String> {
     let strict = network_policy::strict_security();
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
     let key = format!("{strict}:{host}:{port}:{public_dns}");
     {
-        let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
-        if let Some(http) = cached_client(&cache, &key, Instant::now()) {
+        let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
+        if let Some(entry) = cache.get_mut(&key) {
+            let now = Instant::now();
+            if now >= entry.next_check_at && !entry.revalidating {
+                if !strict && entry.addrs.is_empty() {
+                    // 非严格模式没有固定地址可复检：只推后复检点
+                    entry.next_check_at = now + CLIENT_TTL;
+                } else {
+                    entry.revalidating = true;
+                    spawn_revalidation(key.clone(), target.clone(), public_dns, strict);
+                }
+            }
+            let http = entry.http.clone();
             return Ok((target, http));
         }
     }
-    let (addrs, ttl) = if public_dns {
-        let resolver = build_client(crate::media_dns::HOST, &crate::media_dns::BOOTSTRAP)?;
-        let resolution = crate::media_dns::resolve(&resolver, host, port).await?;
-        network_policy::check_addresses_with_mode(&resolution.addresses, strict)?;
-        (resolution.addresses, CLIENT_TTL.min(resolution.ttl))
-    } else if strict {
-        (network_policy::resolve_target(&target, strict).await?, CLIENT_TTL)
-    } else {
-        (Vec::new(), CLIENT_TTL)
-    };
+    let (addrs, ttl) = resolve_addrs(&target, public_dns, strict).await?;
     let http = Arc::new(build_client(host, &addrs)?);
     let now = Instant::now();
     let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
-    // 同时到达的请求可能已完成解析；不延长已有结果的有效期。
-    let http = cached_client(&cache, &key, now).unwrap_or(http);
-    if !cache.get(&key).is_some_and(|(expires, _)| now < *expires) {
-        cache.retain(|_, (expires, _)| now < *expires);
-        if cache.len() >= 64 {
-            cache.clear();
-        }
-        cache.insert(key, (now + ttl, http.clone()));
+    // 同时到达的请求可能已完成解析；复用先建好的那条客户端与连接池。
+    if let Some(existing) = cache.get(&key) {
+        let http = existing.http.clone();
+        return Ok((target, http));
     }
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        ClientEntry {
+            http: http.clone(),
+            host: host.to_string(),
+            addrs,
+            validated_at: now,
+            next_check_at: now + ttl,
+            revalidating: false,
+        },
+    );
     Ok((target, http))
 }
 
@@ -262,7 +378,9 @@ async fn get_with_dns_range(
             crate::playback_log::record("network.target_ready", json!({"resource": crate::playback_log::resource_id(raw), "target_resource": crate::playback_log::resource_id(target.as_str()), "dns_or_client_ms": resolving.elapsed().as_millis() as u64, "hop": hop}));
             let mut request = http.get(target.clone()).timeout(timeout);
             if let Some((start, end)) = range {
-                request = request.header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+                request = request
+                    .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity");
             }
             if let Some(value) = accept {
                 request = request.header("Accept", value);
@@ -471,9 +589,20 @@ async fn tcp_probe(addr: Option<SocketAddr>, timeout: Duration) -> Value {
 /// 把三组探测结果压成一句人话结论 + 可执行的建议，issue 里一眼能看懂。
 fn verdict(dns: &Value, tcp: &Value, http: &Value) -> (&'static str, String, Vec<String>) {
     let dns_err = dns.get("error").and_then(|v| v.as_str());
-    let fake = dns.get("has_fake_ip").and_then(|v| v.as_bool()).unwrap_or(false);
-    let kinds = dns.get("kinds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let suspicious = dns.get("suspicious").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let fake = dns
+        .get("has_fake_ip")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let kinds = dns
+        .get("kinds")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let suspicious = dns
+        .get("suspicious")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let status = http.get("status").and_then(|v| v.as_u64());
     let http_err = http.get("error").and_then(|v| v.as_str()).unwrap_or("");
     let tcp_ok = tcp.get("ok").and_then(|v| v.as_bool());
@@ -482,7 +611,8 @@ fn verdict(dns: &Value, tcp: &Value, http: &Value) -> (&'static str, String, Vec
     if dns_err.is_some() && status.is_some() {
         return (
             "dns_false_alarm",
-            "DNS 探测自身失败，但 HTTP 实际可以连通（系统 resolver 异常或被代理接管），不影响使用".into(),
+            "DNS 探测自身失败，但 HTTP 实际可以连通（系统 resolver 异常或被代理接管），不影响使用"
+                .into(),
             vec![],
         );
     }
@@ -536,15 +666,24 @@ fn verdict(dns: &Value, tcp: &Value, http: &Value) -> (&'static str, String, Vec
         );
     }
     if tcp_ok == Some(false) {
-        let timeout = tcp.get("timeout").and_then(|v| v.as_bool()).unwrap_or(false);
+        let timeout = tcp
+            .get("timeout")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         return (
-            if timeout { "tcp_timeout" } else { "tcp_refused" },
+            if timeout {
+                "tcp_timeout"
+            } else {
+                "tcp_refused"
+            },
             if timeout {
                 "DNS 正常，但 TCP 连接无响应（SYN 被丢弃）：运营商或防火墙阻断".to_string()
             } else {
                 format!(
                     "DNS 正常，但 TCP 连接被拒绝：{}",
-                    tcp.get("error").and_then(|v| v.as_str()).unwrap_or("未知原因")
+                    tcp.get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("未知原因")
                 )
             },
             vec![
@@ -573,11 +712,9 @@ fn verdict(dns: &Value, tcp: &Value, http: &Value) -> (&'static str, String, Vec
         );
     }
     match status {
-        Some(code) if (200..400).contains(&code) => (
-            "ok",
-            format!("连通正常（HTTP {code}），线路可用"),
-            vec![],
-        ),
+        Some(code) if (200..400).contains(&code) => {
+            ("ok", format!("连通正常（HTTP {code}），线路可用"), vec![])
+        }
         Some(code) => (
             "http_status",
             format!("域名与网络都通，但服务端返回 HTTP {code}"),
@@ -913,9 +1050,17 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
     let mut attempt = 0;
     let url = url.to_string();
     let target = url::Url::parse(&url).ok();
-    let host = target.as_ref().and_then(|target| target.host_str()).unwrap_or("").to_string();
-    let public_dns = AtomicBool::new(MEDIA_DNS_ROUTES.lock().ok()
-        .is_some_and(|routes| routes.prefers_public(&host, Instant::now())));
+    let host = target
+        .as_ref()
+        .and_then(|target| target.host_str())
+        .unwrap_or("")
+        .to_string();
+    let public_dns = AtomicBool::new(
+        MEDIA_DNS_ROUTES
+            .lock()
+            .ok()
+            .is_some_and(|routes| routes.prefers_public(&host, Instant::now())),
+    );
     let referer = format!("{}/", base());
     with_retry(true, || {
         attempt += 1;
@@ -969,135 +1114,536 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
     .await
 }
 
-/// 分段并发下载大分片（B 方案）。
-///
-/// 为什么需要它：单连接吞吐实测只有 0.35–0.7MB/s（hyper 小块读取被 RTT 放大），
-/// 一片 2.1MB 要 3–5 秒；实测 4 路并发能拿到约 2.2× 加速（带宽共享，不是线性）。
-/// 把分片按字节区间拆开并行取，是**远距离跳转**唯一能压进 2 秒的手段——
-/// 预取救不了「用户直接跳到没缓存的位置」。
-///
-/// 零额外探测成本的做法：第一段直接用 `Range: bytes=0-{chunk-1}` 请求，
-/// - 返回 206 → CDN 支持 Range，解析 `Content-Range` 得到总长，再并发取剩余段；
-/// - 返回 200 → 不支持 Range，这个响应本身就是完整分片，直接读走。
-///
-/// 任何一段失败都回退到 [`fetch_bytes`] 整包下载，保证不会因分段而播不出来。
+/// 首块既探测 Range 支持又保留有效数据；小对象只补剩余部分，不整包重下。
+const RANGE_PROBE_BYTES: u64 = 64 * 1024;
+const MIN_RANGED_BYTES: u64 = 1024 * 1024;
+const MAX_RANGE_BYTES: u64 = 8 * 1024 * 1024;
+/// 限制单个媒体分片（不是整个视频），防止不可信 total 或无长度响应耗尽内存。
+const MAX_RANGED_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+const RANGED_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[path = "net_download_metrics.rs"]
+mod download_metrics;
+use download_metrics::{DownloadTrace, StageTimer, TailPolicy};
+
+type MediaBytes = (Option<String>, Vec<u8>);
+
+struct RangeFailure {
+    message: String,
+    fallback: bool,
+}
+
+impl RangeFailure {
+    fn recoverable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            fallback: true,
+        }
+    }
+
+    fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            fallback: false,
+        }
+    }
+}
+
+fn response_type(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// 只接受单个、完整、可校验的 bytes start-end/total；不接受通配 total 或多区间。
+fn checked_content_range(response: &reqwest::Response) -> Result<(u64, u64, u64), RangeFailure> {
+    let invalid = || RangeFailure::recoverable("分段 Content-Range 无效");
+    let header_values = response.headers().get_all(reqwest::header::CONTENT_RANGE);
+    let mut values = header_values.iter();
+    let value = values
+        .next()
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(invalid)?;
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+    let (span, total) = value
+        .strip_prefix("bytes ")
+        .and_then(|v| v.split_once('/'))
+        .ok_or_else(invalid)?;
+    let (start, end) = span.split_once('-').ok_or_else(invalid)?;
+    let decimal = |s: &str| {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        s.parse::<u64>().map_err(|_| invalid())
+    };
+    let (start, end, total) = (decimal(start)?, decimal(end)?, decimal(total)?);
+    if total > MAX_RANGED_OBJECT_BYTES {
+        return Err(RangeFailure::terminal("媒体分片超过大小限制"));
+    }
+    if start > end || end >= total {
+        return Err(invalid());
+    }
+    Ok((start, end, total))
+}
+
+/// 流式限长：声明长度和实际长度都校验，禁止先 bytes() 收入任意大正文再检查。
+async fn read_media_body(
+    response: reqwest::Response,
+    expected: Option<u64>,
+    limit: u64,
+) -> Result<Vec<u8>, RangeFailure> {
+    read_media_body_prefixed(response, expected, limit, Vec::new()).await
+}
+
+async fn read_media_body_prefixed(
+    mut response: reqwest::Response,
+    expected: Option<u64>,
+    limit: u64,
+    mut bytes: Vec<u8>,
+) -> Result<Vec<u8>, RangeFailure> {
+    // reqwest 的 content_length() 来自 body size_hint，读过前缀后可能只剩余量。
+    // 已读取前缀时按原始 identity 响应头校验完整实体，不把余量错当完整长度。
+    let declared = if bytes.is_empty() {
+        response.content_length()
+    } else {
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    if declared.is_some_and(|len| len > limit) {
+        return Err(RangeFailure::terminal("媒体响应超过大小限制"));
+    }
+    if let (Some(actual), Some(expected)) = (declared, expected) {
+        if actual != expected {
+            return Err(RangeFailure::recoverable("分段 Content-Length 不匹配"));
+        }
+    }
+    let expected = expected.or(declared);
+    if bytes.len() as u64 > limit || expected.is_some_and(|len| bytes.len() as u64 > len) {
+        return Err(RangeFailure::recoverable("分段前缀长度不匹配"));
+    }
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| RangeFailure::recoverable(err_text(&e)))?
+    {
+        if chunk.len() as u64 > limit.saturating_sub(bytes.len() as u64) {
+            return Err(RangeFailure::terminal("媒体响应超过大小限制"));
+        }
+        if expected.is_some_and(|len| bytes.len() as u64 + chunk.len() as u64 > len) {
+            return Err(RangeFailure::recoverable("分段实际长度不匹配"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if expected.is_some_and(|len| bytes.len() as u64 != len) {
+        return Err(RangeFailure::recoverable("媒体响应截断"));
+    }
+    Ok(bytes)
+}
+
+fn require_partial(response: &reqwest::Response) -> Result<(), RangeFailure> {
+    match response.status().as_u16() {
+        206 => Ok(()),
+        // HTTP 拒绝/限流直接结束，不额外发整包请求放大 403/429。
+        200 | 416 => Err(RangeFailure::recoverable("服务端未保持 Range 支持")),
+        _ => Err(RangeFailure::terminal(format!(
+            "HTTP {}",
+            response.status()
+        ))),
+    }
+}
+
+async fn read_partial(
+    response: reqwest::Response,
+    start: u64,
+    end: u64,
+    total: u64,
+) -> Result<Vec<u8>, RangeFailure> {
+    require_partial(&response)?;
+    if checked_content_range(&response)? != (start, end, total) {
+        return Err(RangeFailure::recoverable("分段区间或总长度不匹配"));
+    }
+    read_media_body(response, Some(end - start + 1), MAX_RANGE_BYTES).await
+}
+
+/// 私有注入点只替换发请求动作；生产入口始终经过原有逐跳 URL/DNS/代理策略。
+async fn ranged_attempt<F, Fut>(
+    request: F,
+    parts: usize,
+    trace: Arc<DownloadTrace>,
+    tail_policy: TailPolicy,
+) -> Result<MediaBytes, RangeFailure>
+where
+    F: Fn(Option<(u64, u64)>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<reqwest::Response, String>> + Send + 'static,
+{
+    trace.requests.fetch_add(1, Ordering::Relaxed);
+    let headers_started = Instant::now();
+    let mut probe = request(Some((0, RANGE_PROBE_BYTES - 1)))
+        .await
+        .map_err(RangeFailure::recoverable)?;
+    trace.probe_headers_ms.store(
+        headers_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+    let ctype = response_type(&probe);
+    let body_started = Instant::now();
+    if probe.status().as_u16() == 200 {
+        // 服务端忽略 Range 时原响应就是整包；只发送这一次请求。
+        trace.concurrency.store(1, Ordering::Relaxed);
+        let bytes = read_media_body(probe, None, MAX_RANGED_OBJECT_BYTES).await?;
+        trace
+            .probe_read_ms
+            .store(body_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        return Ok((ctype, bytes));
+    }
+    require_partial(&probe)?;
+    let (start, end, total) = checked_content_range(&probe)?;
+    if start != 0 || end != (RANGE_PROBE_BYTES - 1).min(total - 1) {
+        return Err(RangeFailure::recoverable("首块区间不匹配"));
+    }
+    if end + 1 == total {
+        trace.concurrency.store(1, Ordering::Relaxed);
+        let bytes = read_media_body(probe, Some(total), RANGE_PROBE_BYTES).await?;
+        trace
+            .probe_read_ms
+            .store(body_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        return Ok((ctype, bytes));
+    }
+
+    // 在扇出前先检查声明长度，并确认少量真实正文可读；明显坏响应不放大请求数。
+    if probe.content_length().is_some_and(|len| len != end + 1) {
+        return Err(RangeFailure::recoverable("首块 Content-Length 不匹配"));
+    }
+    let mut prefix = Vec::new();
+    while prefix.len() < 16 * 1024 {
+        let chunk = probe
+            .chunk()
+            .await
+            .map_err(|error| RangeFailure::recoverable(err_text(&error)))?
+            .ok_or_else(|| RangeFailure::recoverable("首块响应截断"))?;
+        if prefix.len() as u64 + chunk.len() as u64 > end + 1 {
+            return Err(RangeFailure::recoverable("首块实际长度不匹配"));
+        }
+        prefix.extend_from_slice(&chunk);
+    }
+    let concurrency = if total < MIN_RANGED_BYTES {
+        1
+    } else {
+        parts.clamp(2, 8)
+    };
+    trace.concurrency.store(concurrency, Ordering::Relaxed);
+    let chunk = (total - end - 1)
+        .div_ceil(concurrency as u64)
+        .min(MAX_RANGE_BYTES);
+    let size =
+        usize::try_from(total).map_err(|_| RangeFailure::terminal("媒体分片超过地址空间"))?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(size)
+        .map_err(|_| RangeFailure::terminal("媒体分片内存分配失败"))?;
+    buffer.resize(size, 0);
+    let mut next = end + 1;
+    // 头校验成功即可重叠读取首块与其余区间，不再串行等首块体读完。
+    // 首块也占一个槽，总在途响应（含首块）仍受 concurrency 限制。
+    // JoinSet Drop 终止全部子任务；任何片失败都不提交半成品。
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut pending: HashMap<u64, (u64, Instant)> = HashMap::new();
+    let mut completed = Vec::with_capacity(concurrency);
+    // 超大对象受 MAX_RANGE_BYTES 分批时保留原路径，不在超出 parts 的请求组投机救援。
+    let rescue_budgeted =
+        concurrency > 1 && (total - end - 1).div_ceil(chunk) <= concurrency as u64;
+    pending.insert(0, (end, body_started));
+    let probe_trace = trace.clone();
+    tasks.spawn(async move {
+        let _read = StageTimer::since(&probe_trace.probe_read_ms, body_started);
+        let bytes =
+            read_media_body_prefixed(probe, Some(end + 1), RANGE_PROBE_BYTES, prefix).await?;
+        Ok::<_, RangeFailure>((0u64, bytes, body_started.elapsed()))
+    });
+    loop {
+        while tasks.len() < concurrency && next < total {
+            let start = next;
+            let end = (start + chunk - 1).min(total - 1);
+            next = end + 1;
+            let request = request.clone();
+            let trace = trace.clone();
+            let started = Instant::now();
+            pending.insert(start, (end, started));
+            tasks.spawn(async move {
+                trace.requests.fetch_add(1, Ordering::Relaxed);
+                let response = request(Some((start, end)))
+                    .await
+                    .map_err(RangeFailure::recoverable)?;
+                let bytes = read_partial(response, start, end, total).await?;
+                trace.range_done(started);
+                Ok::<_, RangeFailure>((start, bytes, started.elapsed()))
+            });
+        }
+        let rescue = if rescue_budgeted && next == total && pending.len() == 1 && tasks.len() == 1 {
+            pending.iter().next().and_then(|(&start, &(end, started))| {
+                tail_policy
+                    .threshold(end - start + 1, chunk, &completed)
+                    .map(|threshold| (start, end, started, threshold))
+            })
+        } else {
+            None
+        };
+        let joined = if let Some((start, end, started, threshold)) = rescue {
+            tokio::select! {
+                // 边界同时完成时优先收已成功结果，不为刚完成的尾块额外发请求。
+                biased;
+                result = tasks.join_next() => result,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(started + threshold)) => {
+                    // 这一标记在取消/回收前设置；即使此刻撞到外层20s截止，也不再整包回退。
+                    trace.tail_rescue.store(1, Ordering::Relaxed);
+                    trace.tail_threshold_ms.store(threshold.as_millis() as u64, Ordering::Relaxed);
+                    trace.tail_wait_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    trace.range_done(started);
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    // 原尾 future（含其 response/prefix）已 drop。只重取同一完整区间，
+                    // 其它已校验字节留在 buffer；救援本身沿用外层阶段剩余时间，没有新deadline。
+                    trace.requests.fetch_add(1, Ordering::Relaxed);
+                    let retry_started = Instant::now();
+                    let _read = StageTimer::since(&trace.tail_read_ms, retry_started);
+                    let response = request(Some((start, end))).await.map_err(RangeFailure::terminal)?;
+                    let bytes = read_partial(response, start, end, total).await
+                        .map_err(|error| RangeFailure::terminal(error.message))?;
+                    trace.range_done(retry_started);
+                    if start == 0 {
+                        trace.probe_read_ms.store(body_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    }
+                    let start = start as usize;
+                    buffer[start..start + bytes.len()].copy_from_slice(&bytes);
+                    return Ok((ctype, buffer));
+                }
+            }
+        } else {
+            tasks.join_next().await
+        };
+        let Some(result) = joined else {
+            break;
+        };
+        let result = result
+            .map_err(|_| RangeFailure::recoverable("分段任务中断"))
+            .and_then(|result| result);
+        match result {
+            Ok((start, bytes, elapsed)) => {
+                pending.remove(&start);
+                if start != 0 {
+                    completed.push((bytes.len() as u64, elapsed));
+                }
+                let start = start as usize;
+                buffer[start..start + bytes.len()].copy_from_slice(&bytes);
+            }
+            Err(error) => {
+                tasks.abort_all();
+                // 回退前先回收取消任务，避免旧分段与新整包下载重叠。
+                while tasks.join_next().await.is_some() {}
+                return Err(error);
+            }
+        }
+    }
+    Ok((ctype, buffer))
+}
+
+#[cfg(test)]
+async fn fetch_bytes_ranged_with<F, Fut>(request: F, parts: usize) -> Result<MediaBytes, String>
+where
+    F: Fn(Option<(u64, u64)>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<reqwest::Response, String>> + Send + 'static,
+{
+    fetch_bytes_ranged_with_trace(request, parts, Arc::new(DownloadTrace::new())).await
+}
+
+async fn fetch_bytes_ranged_with_trace<F, Fut>(
+    request: F,
+    parts: usize,
+    trace: Arc<DownloadTrace>,
+) -> Result<MediaBytes, String>
+where
+    F: Fn(Option<(u64, u64)>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<reqwest::Response, String>> + Send + 'static,
+{
+    fetch_bytes_ranged_with_policy(request, parts, trace, TailPolicy::default()).await
+}
+
+async fn fetch_bytes_ranged_with_policy<F, Fut>(
+    request: F,
+    parts: usize,
+    trace: Arc<DownloadTrace>,
+    tail_policy: TailPolicy,
+) -> Result<MediaBytes, String>
+where
+    F: Fn(Option<(u64, u64)>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<reqwest::Response, String>> + Send + 'static,
+{
+    if parts == 1 {
+        trace.requests.fetch_add(1, Ordering::Relaxed);
+        trace.concurrency.store(1, Ordering::Relaxed);
+        return tokio::time::timeout(RANGED_TIMEOUT, async {
+            let started = Instant::now();
+            let response = request(None).await?;
+            trace
+                .probe_headers_ms
+                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            if response.status().as_u16() != 200 {
+                return Err(format!("HTTP {}", response.status().as_u16()));
+            }
+            let ctype = response_type(&response);
+            let body_started = Instant::now();
+            let bytes = read_media_body(response, None, MAX_RANGED_OBJECT_BYTES)
+                .await
+                .map_err(|error| error.message)?;
+            trace
+                .probe_read_ms
+                .store(body_started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            Ok((ctype, bytes))
+        })
+        .await
+        .map_err(|_| "整包下载超时".to_string())?;
+    }
+    let failure = match tokio::time::timeout(
+        tail_policy.phase_budget,
+        ranged_attempt(request.clone(), parts, trace.clone(), tail_policy),
+    )
+    .await
+    {
+        Ok(Ok(value)) => return Ok(value),
+        Ok(Err(failure)) => failure,
+        Err(_) => RangeFailure::recoverable("分段下载超时"),
+    };
+    if !failure.fallback || trace.tail_rescue.load(Ordering::Relaxed) != 0 {
+        // 单尾救援与整包回退共用一次恢复预算；救援错误/超时不再重新下载全片。
+        return Err(failure.message);
+    }
+    // 最多回退一次；不调用具有三次重试的 fetch_bytes，整条路径最多两个 20s 窗口。
+    trace.fallback.store(1, Ordering::Relaxed);
+    tokio::time::timeout(RANGED_TIMEOUT, async {
+        trace.requests.fetch_add(1, Ordering::Relaxed);
+        let response = request(None).await?;
+        if response.status().as_u16() != 200 {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        let ctype = response_type(&response);
+        let bytes = read_media_body(response, None, MAX_RANGED_OBJECT_BYTES)
+            .await
+            .map_err(|error| error.message)?;
+        Ok((ctype, bytes))
+    })
+    .await
+    .map_err(|_| "整包回退超时".to_string())?
+}
+
+/// 有界分段下载：64KiB 首块复用、严格校验、取消联动，异常最多单次整包回退。
 pub async fn fetch_bytes_ranged(
     url: &str,
     parts: usize,
 ) -> Result<(Option<String>, Vec<u8>), String> {
-    const MIN_RANGED_BYTES: u64 = 1024 * 1024;
-    let parts = parts.clamp(2, 8) as u64;
-
     let referer = format!("{}/", base());
-    let public_dns = AtomicBool::new(
-        MEDIA_DNS_ROUTES
-            .lock()
-            .ok()
-            .is_some_and(|routes| routes.prefers_public(host_of(url), Instant::now())),
-    );
-
-    // 第一段：探测 + 取首块。用 0-0 只取 1 字节最省，但多一次往返；
-    // 这里直接取一个完整 chunk，探测与下载合一。
-    let probe = match get_with_dns_range(
-        url,
-        Duration::from_secs(20),
-        None,
-        Some(&referer),
-        public_dns.load(Ordering::Relaxed),
-        Some((0, 0)),
-    )
-    .await
-    {
-        Ok(resp) => resp,
-        // 探测都失败时交给整包路径，由它统一重试与报错
-        Err(_) => return fetch_bytes(url).await,
-    };
-
-    if probe.status().as_u16() != 206 {
-        // 不支持 Range（或服务端忽略了 Range 头）：整包下载
-        return fetch_bytes(url).await;
-    }
-
-    let total = probe
-        .headers()
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit('/').next())
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    let ctype = probe
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    drop(probe);
-
-    let Some(total) = total else {
-        return fetch_bytes(url).await;
-    };
-    if total < MIN_RANGED_BYTES {
-        return fetch_bytes(url).await;
-    }
-
-    let chunk = total.div_ceil(parts);
-    let mut handles = Vec::new();
-    for index in 0..parts {
-        let start = index * chunk;
-        if start >= total {
-            break;
-        }
-        let end = (start + chunk - 1).min(total - 1);
-        let url = url.to_string();
-        let referer = referer.clone();
-        let use_public_dns = public_dns.load(Ordering::Relaxed);
-        handles.push((start, tokio::spawn(async move {
-            let resp = get_with_dns_range(
-                &url,
-                Duration::from_secs(20),
-                None,
-                Some(&referer),
-                use_public_dns,
-                Some((start, end)),
-            )
-            .await?;
-            if resp.status().as_u16() != 206 {
-                return Err(format!("分段请求返回 {}", resp.status()));
-            }
-            let bytes = resp.bytes().await.map_err(|e| err_text(&e))?.to_vec();
-            Ok::<(u64, Vec<u8>), String>((start, bytes))
-        })));
-    }
-
-    let mut buffer = vec![0u8; total as usize];
-    let mut complete = true;
-    for (expected_start, handle) in handles {
-        match handle.await {
-            Ok(Ok((start, bytes))) if start == expected_start => {
-                let end = start as usize + bytes.len();
-                if end <= buffer.len() {
-                    buffer[start as usize..end].copy_from_slice(&bytes);
-                } else {
-                    complete = false;
+    // 受控对比档位，不做额外测速或盲目探索；无显式配置时保留既有生产档。
+    let configured = std::env::var("HGHUB_MEDIA_DOWNLOAD_PARTS").ok();
+    let selected_parts = download_metrics::parse_parts(configured.as_deref(), parts);
+    let trace = Arc::new(DownloadTrace::new());
+    let public_dns =
+        Arc::new(AtomicBool::new(MEDIA_DNS_ROUTES.lock().ok().is_some_and(
+            |routes| routes.prefers_public(host_of(url), Instant::now()),
+        )));
+    let route = public_dns.clone();
+    let owned_url = url.to_string();
+    let result = fetch_bytes_ranged_with_trace(
+        move |range| {
+            let url = owned_url.clone();
+            let referer = referer.clone();
+            let route = route.clone();
+            async move {
+                let using_public_dns = route.load(Ordering::Relaxed);
+                let result = get_with_dns_range(
+                    &url,
+                    RANGED_TIMEOUT,
+                    None,
+                    Some(&referer),
+                    using_public_dns,
+                    range,
+                )
+                .await;
+                if let Err(error) = &result {
+                    // 保留原整包路径的代理自愈及备用 DNS；只改变既有单次回退的路由，
+                    // 不在子任务内部重试，备用地址仍经过同一套 DNS 安全校验。
+                    heal_client(error);
+                    if url::Url::parse(&url)
+                        .ok()
+                        .is_some_and(|target| crate::media_dns::eligible(&target, error))
+                    {
+                        route.store(!using_public_dns, Ordering::Relaxed);
+                    }
                 }
+                result
             }
-            _ => complete = false,
-        }
-    }
-
-    if !complete {
-        // 任一段失败：整包重下，绝不返回半截数据（半截分片会让播放器直接报错）
-        return fetch_bytes(url).await;
-    }
-
+        },
+        selected_parts,
+        trace.clone(),
+    )
+    .await;
     crate::playback_log::record(
-        "network.ranged",
+        "network.download",
         json!({
             "resource": crate::playback_log::resource_id(url),
-            "parts": parts,
-            "bytes": total,
+            "requested_parts": selected_parts,
+            "concurrency": trace.concurrency.load(Ordering::Relaxed),
+            "request_count": trace.requests.load(Ordering::Relaxed),
+            "probe_headers_ms": trace.probe_headers_ms.load(Ordering::Relaxed),
+            "probe_read_ms": trace.probe_read_ms.load(Ordering::Relaxed),
+            "slowest_range_ms": trace.slowest_range_ms.load(Ordering::Relaxed),
+            "fallback_count": trace.fallback.load(Ordering::Relaxed),
+            "recovery_kind": trace.recovery_kind(),
+            "tail_rescue": trace.tail_rescue.load(Ordering::Relaxed) != 0,
+            "tail_threshold_ms": trace.tail_threshold_ms.load(Ordering::Relaxed),
+            "tail_wait_ms": trace.tail_wait_ms.load(Ordering::Relaxed),
+            "tail_read_ms": trace.tail_read_ms.load(Ordering::Relaxed),
+            "elapsed_ms": trace.started.elapsed().as_millis() as u64,
+            "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()),
+            "error_kind": result.as_ref().err().map(|error| crate::playback_log::error_kind(error)),
         }),
     );
-    Ok((ctype, buffer))
+    if public_dns.load(Ordering::Relaxed) {
+        if let Ok(mut routes) = MEDIA_DNS_ROUTES.lock() {
+            if result.is_ok() {
+                routes.remember(host_of(url), Instant::now());
+            } else {
+                routes.forget(host_of(url));
+            }
+        }
+    }
+    if let Ok((_, bytes)) = &result {
+        crate::playback_log::record(
+            "network.ranged",
+            json!({
+                "resource": crate::playback_log::resource_id(url),
+                "parts": selected_parts, "concurrency": trace.concurrency.load(Ordering::Relaxed),
+                "request_count": trace.requests.load(Ordering::Relaxed), "bytes": bytes.len(),
+            }),
+        );
+    }
+    result
 }
+
+#[cfg(test)]
+#[path = "net_download_profile_tests.rs"]
+mod download_profile_tests;
+#[cfg(test)]
+#[path = "net_ranged_tests.rs"]
+mod ranged_tests;
+#[cfg(test)]
+#[path = "net_tail_rescue_tests.rs"]
+mod tail_rescue_tests;
 
 fn host_of(raw: &str) -> &str {
     raw.split("://")
@@ -1126,11 +1672,23 @@ mod tests {
         refresh_client();
         CLIENTS.lock().unwrap().insert(
             format!("{}:{host}:{port}:false", network_policy::strict_security()),
-            (Instant::now() + CLIENT_TTL, Arc::new(failed_client)),
+            ClientEntry {
+                http: Arc::new(failed_client),
+                host: host.to_string(),
+                addrs: Vec::new(),
+                validated_at: Instant::now(),
+                next_check_at: Instant::now() + CLIENT_TTL,
+                revalidating: false,
+            },
         );
-        let (_, bytes) = fetch_bytes(&raw).await.expect("备用 DNS 应恢复真实媒体下载");
+        let (_, bytes) = fetch_bytes(&raw)
+            .await
+            .expect("备用 DNS 应恢复真实媒体下载");
         assert!(!bytes.is_empty());
-        assert!(MEDIA_DNS_ROUTES.lock().unwrap().prefers_public(host, Instant::now()));
+        assert!(MEDIA_DNS_ROUTES
+            .lock()
+            .unwrap()
+            .prefers_public(host, Instant::now()));
         let (_, again) = fetch_bytes(&raw).await.expect("后续请求应复用恢复的路径");
         if bytes.starts_with(b"#EXTM3U") {
             assert!(again.starts_with(b"#EXTM3U"));
@@ -1238,6 +1796,51 @@ mod tests {
         }
     }
 
+    /// 联网验证：客户端跨 30s DNS 复检点保活。手动运行：
+    /// `cargo test --lib live_client_pool_survives_revalidation -- --ignored --nocapture`
+    /// 只做 DNS 解析与客户端状态检查（不发媒体请求），验证连接池保活的三个语义：
+    /// 首建 → 跨复检点后客户端仍是同一实例（连接池存活）→ 复检时间戳被后台任务刷新。
+    #[tokio::test]
+    #[ignore = "联网验证：需要真实 DNS 解析，手动用 --ignored --nocapture 运行"]
+    async fn live_client_pool_survives_revalidation() {
+        let target = format!("{}/", crate::net::base());
+        refresh_client();
+        let (_, first) = client_for_dns(&target, false).await.expect("first client");
+        let key = format!(
+            "{}:huangguoai.com:443:false",
+            network_policy::strict_security()
+        );
+        let initial_next_check = CLIENTS
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|e| e.next_check_at)
+            .expect("entry should exist after first use");
+
+        // 跨过复检点：下一次取用会触发后台复检，但客户端实例保持不变
+        tokio::time::sleep(CLIENT_TTL + Duration::from_secs(5)).await;
+        let (_, second) = client_for_dns(&target, false).await.expect("second client");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "DNS 复检答案一致时应保留同一客户端实例（连接池存活）"
+        );
+
+        // 后台复检完成后复检点应被推后（不再卡在初始值上反复触发）
+        let mut refreshed = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let next = CLIENTS.lock().unwrap().get(&key).map(|e| e.next_check_at);
+            if let Some(next) = next {
+                if next > initial_next_check {
+                    refreshed = true;
+                    break;
+                }
+            }
+        }
+        assert!(refreshed, "后台复检应刷新复检点时间戳");
+        println!("client pool kept warm across revalidation; entry refreshed");
+    }
+
     #[tokio::test]
     async fn non_idempotent_operations_are_attempted_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1270,26 +1873,49 @@ mod tests {
     }
 
     #[test]
-    fn pinned_clients_expire_without_extending_the_dns_ttl() {
+    fn revalidation_keeps_warm_pool_when_addresses_unchanged() {
         let now = Instant::now();
-        let client = Arc::new(reqwest::Client::new());
-        let mut cache = ClientCache::new();
-        cache.insert(
-            "true:example.com:443".into(),
-            (now + CLIENT_TTL, client.clone()),
-        );
-        assert!(Arc::ptr_eq(
-            &cached_client(
-                &cache,
-                "true:example.com:443",
-                now + Duration::from_secs(29)
-            )
-            .unwrap(),
-            &client
-        ));
-        assert!(cached_client(&cache, "true:example.com:443", now + CLIENT_TTL).is_none());
-        assert!(cached_client(&cache, "false:example.com:443", now).is_none());
-        assert!(cached_client(&cache, "true:example.com:8443", now).is_none());
+        let addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let addr2: SocketAddr = "93.184.216.35:443".parse().unwrap();
+        let mut entry = ClientEntry {
+            http: Arc::new(reqwest::Client::new()),
+            host: "example.com".into(),
+            addrs: vec![addr, addr2],
+            validated_at: now,
+            next_check_at: now,
+            revalidating: true,
+        };
+
+        // 相同答案 → 保留客户端（连接池不重建），推后复检点
+        let rebuilt = apply_revalidation(&mut entry, Ok((vec![addr, addr2], CLIENT_TTL)), now);
+        assert!(!rebuilt);
+        assert_eq!(entry.next_check_at, now + CLIENT_TTL);
+        assert_eq!(entry.addrs, vec![addr, addr2]);
+
+        // 乱序的相同答案也视为一致（DNS 答案顺序不稳定）
+        entry.revalidating = true;
+        let rebuilt = apply_revalidation(&mut entry, Ok((vec![addr2, addr], CLIENT_TTL)), now);
+        assert!(!rebuilt);
+        assert_eq!(entry.addrs, vec![addr, addr2], "地址集合一致时不重建");
+
+        // 新增了一个地址（合法答案变化）→ 重建客户端并更换固定地址
+        let addr3: SocketAddr = "93.184.216.36:443".parse().unwrap();
+        entry.revalidating = true;
+        let before = entry.http.clone();
+        let rebuilt =
+            apply_revalidation(&mut entry, Ok((vec![addr, addr2, addr3], CLIENT_TTL)), now);
+        assert!(rebuilt);
+        assert!(!Arc::ptr_eq(&before, &entry.http));
+        assert_eq!(entry.addrs, vec![addr, addr2, addr3]);
+        assert_eq!(entry.next_check_at, now + CLIENT_TTL);
+
+        // 复检失败 → 保留旧客户端（地址仍是构建时校验过的），按 30s 节奏重试
+        let before = entry.http.clone();
+        let rebuilt = apply_revalidation(&mut entry, Err("解析失败".into()), now);
+        assert!(!rebuilt);
+        assert!(Arc::ptr_eq(&before, &entry.http));
+        assert_eq!(entry.next_check_at, now + CLIENT_TTL);
+        assert!(!entry.revalidating);
     }
 
     #[test]

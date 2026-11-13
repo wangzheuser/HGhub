@@ -143,7 +143,8 @@ fn serve(app: &tauri::AppHandle, mut stream: TcpStream) -> std::io::Result<()> {
         // m3u8 分片/key 改写按请求 Host 动态生成：本机访问是 127.0.0.1:17650，
         // 局域网设备访问是 <LAN-IP>:17650，各自拿到的播放列表都指向发起方可达的桥。
         let media_origin = request_origin(host.as_deref());
-        let response = tauri::async_runtime::block_on(crate::media::handle(path, query, &media_origin));
+        let response =
+            tauri::async_runtime::block_on(crate::media::handle(path, query, &media_origin));
         return write_media(&mut stream, response, method == "HEAD");
     }
 
@@ -161,7 +162,11 @@ fn serve(app: &tauri::AppHandle, mut stream: TcpStream) -> std::io::Result<()> {
             match serde_json::from_str(&body) {
                 Ok(v) => v,
                 Err(_) => {
-                    return write_json(&mut stream, 200, &json!({"ok": false, "error": "请求体不是有效 JSON"}));
+                    return write_json(
+                        &mut stream,
+                        200,
+                        &json!({"ok": false, "error": "请求体不是有效 JSON"}),
+                    );
                 }
             }
         };
@@ -169,7 +174,9 @@ fn serve(app: &tauri::AppHandle, mut stream: TcpStream) -> std::io::Result<()> {
         return match result {
             Ok(data) => write_json(&mut stream, 200, &json!({ "ok": true, "data": data })),
             // 未知命令是编程错误，用 400 与业务错误区分
-            Err(e) if e.starts_with("未知命令") => write_json(&mut stream, 400, &json!({ "ok": false, "error": e })),
+            Err(e) if e.starts_with("未知命令") => {
+                write_json(&mut stream, 400, &json!({ "ok": false, "error": e }))
+            }
             // 业务错误保持 HTTP 200 + {ok:false}，与 invoke 的 Err(String) 语义一致
             Err(e) => write_json(&mut stream, 200, &json!({ "ok": false, "error": e })),
         };
@@ -191,7 +198,8 @@ fn request_origin(host: Option<&str>) -> String {
         Some(h)
             if !h.is_empty()
                 && h.len() <= 255
-                && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.[]:".contains(&b)) =>
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-.[]:".contains(&b)) =>
         {
             format!("http://{h}")
         }
@@ -228,14 +236,41 @@ async fn dispatch(app: &tauri::AppHandle, cmd: &str, args: &Value) -> Result<Val
     match cmd {
         /* 基础 */
         "app_boot" => api::app_boot(app.state::<Api>()).await,
-        "security_set" => api::security_set(bool_arg(args, "strict")?).await.map(Value::Bool),
-        "debug_log" => api::debug_log(app.clone(), str_arg(args, "msg")?).await.map(|_| Value::Null),
+        "security_set" => api::security_set(bool_arg(args, "strict")?)
+            .await
+            .map(Value::Bool),
+        "debug_log" => api::debug_log(app.clone(), str_arg(args, "msg")?)
+            .await
+            .map(|_| Value::Null),
         "net_diag" => api::net_diag().await,
         "cache_clear" => api::cache_clear().await.map(|_| Value::Null),
-        "media_warmup" => api::media_warmup(str_arg(args, "url")?).await.map(Value::Bool),
+        "cache_stats" => api::cache_stats().await,
+        "media_warmup" => api::media_warmup(str_arg(args, "url")?)
+            .await
+            .map(Value::Bool),
+        "media_prepare" => api::media_prepare(str_arg(args, "url")?)
+            .await
+            .map(Value::Bool),
+        "media_warmup_status" => api::media_warmup_status(str_arg(args, "url")?).await,
+        "media_warmup_cancel" => api::media_warmup_cancel(str_arg(args, "url")?)
+            .await
+            .map(|_| Value::Null),
+        "media_prefetch" => api::media_prefetch(str_arg(args, "url")?)
+            .await
+            .map(Value::Bool),
+        "media_prefetch_cancel" => {
+            api::media_prefetch_cancel(args.get("url").and_then(Value::as_str).map(str::to_string))
+                .await
+                .map(Value::Bool)
+        }
+        "media_session" => api::media_session(str_arg(args, "url")?, bool_arg(args, "active")?)
+            .await
+            .map(Value::Bool),
         /* 线路（数据源） */
         "line_state" => api::line_state().await,
-        "line_set" => api::line_set(app.state::<Api>(), str_arg(args, "url")?).await.map(Value::String),
+        "line_set" => api::line_set(app.state::<Api>(), str_arg(args, "url")?)
+            .await
+            .map(Value::String),
         "line_mirrors" => api::line_mirrors().await,
         "line_probe" => api::line_probe(str_vec(args, "urls")?).await,
         "line_auto" => api::line_auto().await,
@@ -243,44 +278,194 @@ async fn dispatch(app: &tauri::AppHandle, cmd: &str, args: &Value) -> Result<Val
         "line_health" => api::line_health().await,
         "check_update" => api::check_update().await,
         /* 会话 */
-        "api_login" => api::api_login(app.state::<Api>(), str_arg(args, "username")?, str_arg(args, "password")?).await,
-        "api_register" => api::api_register(app.state::<Api>(), str_arg(args, "username")?, str_arg(args, "password")?, opt_str(args, "email").unwrap_or_default()).await,
+        "api_login" => {
+            api::api_login(
+                app.state::<Api>(),
+                str_arg(args, "username")?,
+                str_arg(args, "password")?,
+            )
+            .await
+        }
+        "api_register" => {
+            api::api_register(
+                app.state::<Api>(),
+                str_arg(args, "username")?,
+                str_arg(args, "password")?,
+                opt_str(args, "email").unwrap_or_default(),
+            )
+            .await
+        }
         "api_logout" => api::api_logout(app.state::<Api>()).await,
         "api_me" => api::api_me(app.state::<Api>()).await,
         /* 列表 / 详情 / 播放 */
-        "api_feed" => api::api_feed(app.state::<Api>(), u32_arg(args, "page")?, u32_arg(args, "size")?).await,
+        "api_feed" => {
+            api::api_feed(
+                app.state::<Api>(),
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
         "api_topics" => api::api_topics(app.state::<Api>()).await,
         "api_topic" => api::api_topic(app.state::<Api>(), str_arg(args, "slug")?).await,
         "api_tags" => api::api_tags(app.state::<Api>()).await,
-        "api_tag_videos" => api::api_tag_videos(app.state::<Api>(), str_arg(args, "tag")?, u32_arg(args, "page")?, u32_arg(args, "size")?).await,
-        "api_category" => api::api_category(app.state::<Api>(), str_arg(args, "cate")?, u32_arg(args, "page")?, u32_arg(args, "size")?).await,
+        "api_tag_videos" => {
+            api::api_tag_videos(
+                app.state::<Api>(),
+                str_arg(args, "tag")?,
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
+        "api_category" => {
+            api::api_category(
+                app.state::<Api>(),
+                str_arg(args, "cate")?,
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
         "api_rank" => api::api_rank(app.state::<Api>(), str_arg(args, "kind")?).await,
-        "api_search" => api::api_search(app.state::<Api>(), str_arg(args, "q")?, u32_arg(args, "page")?, u32_arg(args, "size")?, opt_str(args, "kind")).await,
+        "api_search" => {
+            api::api_search(
+                app.state::<Api>(),
+                str_arg(args, "q")?,
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+                opt_str(args, "kind"),
+            )
+            .await
+        }
         "api_search_hot" => api::api_search_hot(app.state::<Api>()).await,
-        "api_posts" => api::api_posts(app.state::<Api>(), u32_arg(args, "page")?, u32_arg(args, "size")?).await,
+        "api_posts" => {
+            api::api_posts(
+                app.state::<Api>(),
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
         "api_post" => api::api_post(app.state::<Api>(), i64_arg(args, "id")?).await,
-        "api_post_playback" => api::api_post_playback(app.state::<Api>(), i64_arg(args, "id")?).await,
+        "api_post_playback" => {
+            api::api_post_playback(app.state::<Api>(), i64_arg(args, "id")?).await
+        }
         "api_video" => api::api_video(app.state::<Api>(), i64_arg(args, "id")?).await,
-        "api_play" => api::api_play(app.state::<Api>(), i64_arg(args, "id")?, u32_arg(args, "ep")?).await,
+        "api_play" => {
+            api::api_play(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                u32_arg(args, "ep")?,
+            )
+            .await
+        }
         /* 评论 / 互动 */
-        "api_comments" => api::api_comments(app.state::<Api>(), i64_arg(args, "id")?, u32_arg(args, "ep")?, u32_arg(args, "page")?, u32_arg(args, "size")?).await,
-        "api_comment_send" => api::api_comment_send(app.state::<Api>(), i64_arg(args, "id")?, u32_arg(args, "ep")?, str_arg(args, "text")?, opt_i64(args, "replyId")).await,
-        "api_like" => api::api_like(app.state::<Api>(), i64_arg(args, "id")?, u32_arg(args, "ep")?, bool_arg(args, "on")?).await,
-        "api_collect" => api::api_collect(app.state::<Api>(), i64_arg(args, "id")?, bool_arg(args, "on")?).await,
-        "api_follow" => api::api_follow(app.state::<Api>(), i64_arg(args, "uid")?, bool_arg(args, "on")?).await,
-        "api_post_like" => api::api_post_like(app.state::<Api>(), i64_arg(args, "id")?, bool_arg(args, "on")?).await,
-        "api_post_collect" => api::api_post_collect(app.state::<Api>(), i64_arg(args, "id")?, bool_arg(args, "on")?).await,
-        "api_post_comments" => api::api_post_comments(app.state::<Api>(), i64_arg(args, "id")?, u32_arg(args, "page")?, u32_arg(args, "size")?).await,
+        "api_comments" => {
+            api::api_comments(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                u32_arg(args, "ep")?,
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
+        "api_comment_send" => {
+            api::api_comment_send(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                u32_arg(args, "ep")?,
+                str_arg(args, "text")?,
+                opt_i64(args, "replyId"),
+            )
+            .await
+        }
+        "api_like" => {
+            api::api_like(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                u32_arg(args, "ep")?,
+                bool_arg(args, "on")?,
+            )
+            .await
+        }
+        "api_collect" => {
+            api::api_collect(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                bool_arg(args, "on")?,
+            )
+            .await
+        }
+        "api_follow" => {
+            api::api_follow(
+                app.state::<Api>(),
+                i64_arg(args, "uid")?,
+                bool_arg(args, "on")?,
+            )
+            .await
+        }
+        "api_post_like" => {
+            api::api_post_like(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                bool_arg(args, "on")?,
+            )
+            .await
+        }
+        "api_post_collect" => {
+            api::api_post_collect(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                bool_arg(args, "on")?,
+            )
+            .await
+        }
+        "api_post_comments" => {
+            api::api_post_comments(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
         "api_post_categories" => api::api_post_categories(app.state::<Api>()).await,
-        "api_post_category" => api::api_post_category(app.state::<Api>(), str_arg(args, "route")?, u32_arg(args, "page")?, u32_arg(args, "size")?).await,
+        "api_post_category" => {
+            api::api_post_category(
+                app.state::<Api>(),
+                str_arg(args, "route")?,
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
         "api_related" => api::api_related(app.state::<Api>(), i64_arg(args, "id")?).await,
-        "api_following" => api::api_following(app.state::<Api>(), u32_arg(args, "page")?, u32_arg(args, "size")?).await,
+        "api_following" => {
+            api::api_following(
+                app.state::<Api>(),
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
         "api_user" => api::api_user(app.state::<Api>(), i64_arg(args, "id")?).await,
         "api_user_stats" => api::api_user_stats(app.state::<Api>(), i64_arg(args, "id")?).await,
-        "api_user_videos" => api::api_user_videos(app.state::<Api>(), i64_arg(args, "id")?, u32_arg(args, "page")?, u32_arg(args, "size")?).await,
+        "api_user_videos" => {
+            api::api_user_videos(
+                app.state::<Api>(),
+                i64_arg(args, "id")?,
+                u32_arg(args, "page")?,
+                u32_arg(args, "size")?,
+            )
+            .await
+        }
         /* 播放诊断（同步命令） */
         "playback_log_status" => jv(crate::playback_log::playback_log_status()?),
-        "playback_log_set" => jv(crate::playback_log::playback_log_set(bool_arg(args, "enabled")?)?),
+        "playback_log_set" => jv(crate::playback_log::playback_log_set(bool_arg(
+            args, "enabled",
+        )?)?),
         "playback_log_write" => {
             let entries: Vec<crate::playback_log::Entry> =
                 serde_json::from_value(args.get("entries").cloned().unwrap_or(Value::Null))
@@ -332,7 +517,12 @@ fn bool_arg(args: &Value, key: &str) -> Result<bool, String> {
 fn str_vec(args: &Value, key: &str) -> Result<Vec<String>, String> {
     args.get(key)
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
         .ok_or_else(|| format!("缺少参数 {key}"))
 }
 
@@ -365,6 +555,14 @@ fn write_media(
     response: tauri::http::Response<Vec<u8>>,
     head_only: bool,
 ) -> std::io::Result<()> {
+    write_media_to(stream, response, head_only)
+}
+
+fn write_media_to(
+    stream: &mut impl Write,
+    response: tauri::http::Response<Vec<u8>>,
+    head_only: bool,
+) -> std::io::Result<()> {
     let (parts, body) = response.into_parts();
     let mut head = String::with_capacity(320);
     head.push_str(&format!(
@@ -374,10 +572,24 @@ fn write_media(
     ));
     head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     for (name, value) in parts.headers.iter() {
+        // 桥拥有 framing/CORS：上游已有 Content-Length 时也只输出一次真实长度。
+        // 目前 GET 为完整实体（Range 可按 HTTP 语义忽略并返回 200），不宣称支持 206。
+        if matches!(
+            name.as_str(),
+            "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "accept-ranges"
+                | "access-control-allow-origin"
+                | "access-control-expose-headers"
+        ) {
+            continue;
+        }
         if let Ok(value) = value.to_str() {
             head.push_str(&format!("{}: {}\r\n", name.as_str(), value));
         }
     }
+    head.push_str("Accept-Ranges: none\r\n");
     head.push_str("Access-Control-Allow-Origin: *\r\n");
     head.push_str("Access-Control-Expose-Headers: content-length, content-type\r\n");
     head.push_str("Connection: close\r\n\r\n");
@@ -443,22 +655,23 @@ fn serve_static(
         return write_plain(stream, 404, "not found");
     }
 
-    let write_ok = |stream: &mut TcpStream, mime: &str, data: &[u8], head_only: bool| -> std::io::Result<()> {
-        let head = format!(
-            "HTTP/1.1 200 OK\r\n\
+    let write_ok =
+        |stream: &mut TcpStream, mime: &str, data: &[u8], head_only: bool| -> std::io::Result<()> {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
              Content-Type: {mime}\r\n\
              Content-Length: {}\r\n\
              Access-Control-Allow-Origin: *\r\n\
              Cache-Control: no-cache\r\n\
              Connection: close\r\n\r\n",
-            data.len()
-        );
-        stream.write_all(head.as_bytes())?;
-        if !head_only {
-            stream.write_all(data)?;
-        }
-        stream.flush()
-    };
+                data.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            if !head_only {
+                stream.write_all(data)?;
+            }
+            stream.flush()
+        };
 
     // 1) 内嵌资产：release 构建把 dist 打进二进制
     let resolver = app.asset_resolver();
@@ -476,7 +689,11 @@ fn serve_static(
         return write_ok(stream, mime_of(rel), &data, head_only);
     }
 
-    write_plain(stream, 404, "not found - dev 模式请访问 http://localhost:1420")
+    write_plain(
+        stream,
+        404,
+        "not found - dev 模式请访问 http://localhost:1420",
+    )
 }
 
 fn mime_of(path: &str) -> &'static str {
@@ -504,6 +721,41 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn media_response_has_one_authoritative_length_and_honest_range_headers() {
+        let response = || {
+            tauri::http::Response::builder()
+                .status(200)
+                .header("content-length", "999")
+                .header("accept-ranges", "bytes")
+                .header("transfer-encoding", "chunked")
+                .header("content-type", "video/mp2t")
+                .body(b"payload".to_vec())
+                .unwrap()
+        };
+        let mut get = Vec::new();
+        write_media_to(&mut get, response(), false).unwrap();
+        let get = String::from_utf8(get).unwrap();
+        let (headers, body) = get.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            headers
+                .to_ascii_lowercase()
+                .matches("content-length:")
+                .count(),
+            1
+        );
+        assert!(headers.contains("Content-Length: 7\r\n"));
+        assert!(headers.contains("Accept-Ranges: none"));
+        assert!(!headers.contains("transfer-encoding"));
+        assert_eq!(body, "payload");
+        let mut head = Vec::new();
+        write_media_to(&mut head, response(), true).unwrap();
+        let head = String::from_utf8(head).unwrap();
+        let (head_headers, head_body) = head.split_once("\r\n\r\n").unwrap();
+        assert_eq!(head_headers, headers);
+        assert!(head_body.is_empty());
+    }
+
+    #[test]
     fn api_origin_policy_accepts_trusted_frontends() {
         // 缺 Origin / 同源语义 / 回环兜底 / 桥托管页（本机 + 局域网 IP 的 same-origin）
         assert!(origin_allowed_api(None, None));
@@ -513,8 +765,14 @@ mod tests {
         assert!(origin_allowed_api(Some("tauri://localhost"), None));
         assert!(origin_allowed_api(Some("http://tauri.localhost"), None));
         // same-origin：页面来自桥（Host 为局域网地址），Origin 与 Host 一致即放行
-        assert!(origin_allowed_api(Some("http://192.168.1.5:17650"), Some("192.168.1.5:17650")));
-        assert!(origin_allowed_api(Some("http://127.0.0.1:17650"), Some("127.0.0.1:17650")));
+        assert!(origin_allowed_api(
+            Some("http://192.168.1.5:17650"),
+            Some("192.168.1.5:17650")
+        ));
+        assert!(origin_allowed_api(
+            Some("http://127.0.0.1:17650"),
+            Some("127.0.0.1:17650")
+        ));
         // dev Vite 页面仅在 debug 构建放行（allowed_frontend_origin 的既有口径）
         if cfg!(debug_assertions) {
             assert!(origin_allowed_api(Some("http://localhost:1420"), None));
@@ -524,20 +782,35 @@ mod tests {
 
     #[test]
     fn api_origin_policy_rejects_foreign_origins() {
-        assert!(!origin_allowed_api(Some("https://evil.example"), Some("192.168.1.5:17650")));
+        assert!(!origin_allowed_api(
+            Some("https://evil.example"),
+            Some("192.168.1.5:17650")
+        ));
         assert!(!origin_allowed_api(Some("http://localhost:3000"), None));
-        assert!(!origin_allowed_api(Some("http://127.0.0.1:9999"), Some("127.0.0.1:17650")));
+        assert!(!origin_allowed_api(
+            Some("http://127.0.0.1:9999"),
+            Some("127.0.0.1:17650")
+        ));
         assert!(!origin_allowed_api(Some("file://"), None));
         // 局域网设备上的第三方页面：origin 与 Host 不一致 → 拒
-        assert!(!origin_allowed_api(Some("http://192.168.1.9:8080"), Some("192.168.1.5:17650")));
+        assert!(!origin_allowed_api(
+            Some("http://192.168.1.9:8080"),
+            Some("192.168.1.5:17650")
+        ));
     }
 
     #[test]
     fn request_origin_follows_host_header() {
-        assert_eq!(request_origin(Some("192.168.1.5:17650")), "http://192.168.1.5:17650");
+        assert_eq!(
+            request_origin(Some("192.168.1.5:17650")),
+            "http://192.168.1.5:17650"
+        );
         assert_eq!(request_origin(Some("127.0.0.1:17650")), ORIGIN);
         assert_eq!(request_origin(Some("[::1]:17650")), "http://[::1]:17650");
-        assert_eq!(request_origin(Some("nas-home.local:17650")), "http://nas-home.local:17650");
+        assert_eq!(
+            request_origin(Some("nas-home.local:17650")),
+            "http://nas-home.local:17650"
+        );
         // 异常 Host 一律回退，防注入
         assert_eq!(request_origin(Some("")), ORIGIN);
         assert_eq!(request_origin(Some("evil.com/seg")), ORIGIN);

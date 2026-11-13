@@ -69,6 +69,8 @@ pnpm install --frozen-lockfile
 pnpm exec playwright-core install --with-deps chromium
 ```
 
+未安装 Playwright 浏览器时可用 `--browser-executable PATH` 指定本机 Chrome/Edge。测试页在模块加载前（`tests/*.html` 内联脚本）注入 `window.__TAURI_INTERNALS__` 替身：`api.ts` 的 `isTauri` 在模块求值时就定型，必须先于测试模块注入，否则播放器会以浏览器模式把本地桥请求当外部请求全部拦截。
+
 Ubuntu 上可用 `sudo apt-get install ffmpeg` 安装媒体样本生成器，然后运行：
 
 ```sh
@@ -93,7 +95,7 @@ pnpm test:playback
 | --- | --- |
 | `seek` | 共用播放器的真实鼠标点击/拖动、拖动松手后仅定位一次、首帧恢复、暂停/键盘定位、失活取消拖动、开关关闭和保存失败 |
 | `legacy` | 吃瓜详情独立播放器的相同检查 |
-| `stall` | 人为停止 HLS 缓冲后点击未缓冲位置，检查 8 秒超时日志以及恢复缓冲后的首帧；属于故障注入 |
+| `stall` | 暂停缓冲并**挂起分片请求**后点击未缓冲位置（双重故障注入：两个播放器的 seek 都会调用 hls.js 的 `startLoad()`，而 `startLoad()` 首先恢复缓冲，仅暂停缓冲挡不住主动定位），检查 8 秒超时日志以及放开请求并恢复缓冲后的首帧 |
 | `lifecycle` | 两个播放器延迟清单后失活、后台禁止自动播放和分片加载、重新激活后恢复、手动暂停状态保留，以及视频延迟挂载时保持失活 |
 | `mms` | 两个播放器在两种 API 同时存在时优先使用标准 MSE；在模拟 MMS-only 环境中，endstreaming 停止缓冲后点击未缓冲位置，即使没有 startstreaming 事件也能自动恢复并输出首帧 |
 

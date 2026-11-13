@@ -66,5 +66,7 @@ export function usePlaybackActivity(
     v.addEventListener("playing", guard);
     return () => { mounted.current = false; v.removeEventListener("play", guard); v.removeEventListener("playing", guard); v.pause(); };
   }, []);
-  return { play, pause, isActive: () => mounted.current && latest.current.active };
+  return { play, pause, isActive: () => mounted.current && latest.current.active,
+    playWanted: () => wanted.current,
+    restoreWanted: (value: boolean) => { wanted.current = value; } };
 }

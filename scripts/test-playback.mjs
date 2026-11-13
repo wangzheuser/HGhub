@@ -14,14 +14,14 @@ import { createServer as createViteServer } from "vite";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const { values: args } = parseArgs({ options: {
   "media-dir": { type: "string" }, output: { type: "string" }, "browser-executable": { type: "string" },
-  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms" }, help: { type: "boolean" },
+  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms,optimization,mobile" }, help: { type: "boolean" },
 } });
 if (args.help) {
-  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms]");
+  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms,optimization,mobile]");
   process.exit(0);
 }
 const scenarios = args.scenarios.split(",");
-assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms"].includes(s)), "Unknown scenario");
+assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms", "optimization", "mobile"].includes(s)), "Unknown scenario");
 const output = resolve(args.output || join(root, "test-results", "playback", new Date().toISOString().replace(/[:.]/g, "-")));
 await mkdir(dirname(output), { recursive: true });
 await mkdir(output); // Refuse to overwrite artifacts from an earlier run.
@@ -163,15 +163,31 @@ async function seekChecks(page, legacy) {
 async function stallCheck(page) {
   await loadPlayer(page);
   await page.waitForFunction(() => { const v = document.querySelector("video"); return v.buffered.length && v.buffered.end(0) >= 30; });
-  await page.evaluate(async () => { await window.playerSeekFixture.setLogging(true); window.playerSeekFixture.pauseBuffering(); });
-  await clickProgress(page, .8);
-  const logs = await waitLog(page, "seek.timeout");
-  const timeout = logs.find(e => e.event === "seek.timeout");
-  assert.equal(timeout.data.buffering_enabled, false);
-  assert(timeout.data.ready < 3 && timeout.data.seeking, "Timeout must capture the stalled media state");
-  await page.evaluate(() => window.playerSeekFixture.resumeBuffering());
-  await waitLog(page, "seek.resumed");
-  return { fault_injected: true, timeout_ms: timeout.data.elapsed_ms };
+  // hls.js 的 startLoad() 第一件事就是 resumeBuffering()，而两个播放器的 seek 处理
+  // 都会调用 startLoad —— 「缓冲暂停」挡不住主动定位。因此故障注入需要两件套：
+  // 暂停缓冲 + 挂起目标分片的网络请求；恢复时先放开请求，再恢复缓冲。
+  let releaseSegments, heldSegments;
+  const segmentGate = new Promise(done => { releaseSegments = done; });
+  const segmentHeld = new Promise(done => { heldSegments = done; });
+  await page.route("**/seg?*", async route => {
+    heldSegments();
+    await segmentGate;
+    await route.continue();
+  });
+  try {
+    await page.evaluate(async () => { await window.playerSeekFixture.setLogging(true); window.playerSeekFixture.pauseBuffering(); });
+    await clickProgress(page, .8);
+    const logs = await waitLog(page, "seek.timeout");
+    const timeout = logs.find(e => e.event === "seek.timeout");
+    // startLoad 已把缓冲标志恢复成 true（生产语义），此时真正卡住定位的是挂起的分片请求
+    assert.equal(timeout.data.buffering_enabled, true);
+    assert(timeout.data.ready < 3 && timeout.data.seeking, "Timeout must capture the stalled media state");
+    releaseSegments();
+    await heldSegments;
+    await page.evaluate(() => window.playerSeekFixture.resumeBuffering());
+    await waitLog(page, "seek.resumed");
+    return { fault_injected: true, timeout_ms: timeout.data.elapsed_ms };
+  } finally { releaseSegments(); await page.unroute("**/seg?*"); }
 }
 async function managedMediaCheck(page) {
   // Chromium supplies real MSE decoding/buffering; only the MMS constructor and streaming
@@ -263,16 +279,158 @@ async function lifecyclePlayerCheck(page, legacy) {
     return { inactive_paused: state.paused, inactive_fragment_loading: false, manual_pause_preserved: true, native_pause_preserved: true };
   } finally { clearTimeout(holdDeadline); release(); await page.unroute("**/hls?*"); }
 }
+async function optimizationCheck(page) {
+  await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&optimization=1&inactive=1&proxy=${encodeURIComponent(report.media)}`);
+  await page.waitForFunction(() => window.playerSeekFixture && document.querySelector('.player-root'));
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.commands.filter(c => c.command === 'play').length), 0, 'Inactive Feed must not request a play URL');
+  const units = await page.evaluate(() => window.playerSeekFixture.unitChecks());
+  const swipeMode = page.getByRole('button', { name: '上下划切集', exact: true }).first();
+  if (await swipeMode.getAttribute('aria-pressed') !== 'true') await swipeMode.click();
+  await page.waitForTimeout(400);
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.commands.filter(c => c.command === "warmup").length), 0, "Inactive Feed must not warm a target");
+  await page.evaluate(() => {
+    window.playerSeekFixture.warmupAccepted = false;
+    window.playerSeekFixture.setActive(true);
+  });
+  await page.waitForFunction(() => document.querySelector('video'));
+  await page.evaluate(() => window.playerSeekFixture.setBuffer(0));
+  await page.waitForFunction(() => document.querySelector("video").currentTime > 1);
+  await page.locator("video").evaluate(v => v.pause());
+  await page.evaluate(() => window.playerSeekFixture.setBuffer(document.querySelector("video").currentTime + 7));
+  await page.waitForTimeout(400);
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.commands.filter(c => c.command === "warmup").length), 0, "Unhealthy buffer must leave bandwidth to main playback");
+  await page.evaluate(() => window.playerSeekFixture.setBuffer(document.querySelector("video").currentTime + 9));
+  await page.waitForFunction(() => window.playerSeekFixture.commands.some(c => c.command === "warmup"));
+  let warmups = await page.evaluate(() => window.playerSeekFixture.commands.filter(c => c.command === "warmup"));
+  assert.deepEqual([...new Set(warmups.map(c => c.url))], ["https://media.fixture.invalid/list-991-2.m3u8"], "Only next episode may warm, never previous episode or parallel next video");
+  const displayed = await page.locator(".desktop-seek-buffer").evaluate(el => parseFloat(el.style.width));
+  assert(displayed > 8 && displayed < 20, "Buffer display must use seconds/duration rather than seconds as a ratio");
+  await page.evaluate(() => { window.playerSeekFixture.warmupAccepted = true; });
+  await page.waitForFunction(() => window.playerSeekFixture.commands.filter(c => c.command === "warmup").length >= 2);
+  // A buffered seek must not restart an already-running healthy hls.js loader.
+  await page.evaluate(() => { window.playerSeekFixture.clearBufferOverride(); });
+  await page.waitForFunction(() => { const v = document.querySelector("video"); return v.buffered.length && v.buffered.end(0) > 12; });
+  const starts = await page.evaluate(() => window.playerSeekFixture.starts.length);
+  await clickProgress(page, .05);
+  await page.waitForTimeout(150);
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.starts.length), starts, "Buffered seek must not unconditionally call startLoad");
+  // Same-episode codec changes preserve pause/time/rate; let real data arrive before faking buffer.
+  const codecBefore = await page.locator('video').evaluate(v => ({ time: v.currentTime, rate: v.playbackRate }));
+  await page.evaluate(() => window.playerSeekFixture.setPreferHevc(true));
+  await page.waitForFunction(() => window.playerSeekFixture.commands.some(c => c.command === "session_ready" && c.active && c.url === "https://media.fixture.invalid/hevc-991-1.m3u8"));
+  await page.waitForFunction(() => { const v = document.querySelector('video'); return v.readyState >= 2 && !v.seeking; });
+  const codecAfter = await page.locator('video').evaluate(v => ({ time: v.currentTime, rate: v.playbackRate, paused: v.paused }));
+  assert(codecAfter.paused, 'Paused quality switch must not unexpectedly autoplay');
+  assert(Math.abs(codecAfter.time - codecBefore.time) < .5, 'Quality switch must preserve current position');
+  assert.equal(codecAfter.rate, codecBefore.rate, 'Quality switch must preserve playback rate');
+  await page.getByRole('button', { name: '播放', exact: true }).first().click();
+  await page.waitForFunction(() => window.playerSeekFixture.renderedSources.includes('https://media.fixture.invalid/hevc-991-1.m3u8'));
+  await page.evaluate(() => window.playerSeekFixture.setBuffer(document.querySelector("video").currentTime + 9));
+  await page.waitForFunction(() => window.playerSeekFixture.commands.some(c => c.command === "warmup" && c.url === "https://media.fixture.invalid/hevc-991-2.m3u8"));
+  await page.evaluate(() => window.playerSeekFixture.clearBufferOverride());
+  await page.getByRole("button", { name: "下一集 E", exact: true }).click();
+  await page.waitForFunction(() => window.playerSeekFixture.commands.some(c => c.command === "session_ready" && c.active && c.url === "https://media.fixture.invalid/hevc-991-2.m3u8"));
+  // duration 可能仍是上一源的值；必须等待新源实际播放后再暂停注入缓冲。
+  await page.waitForFunction(() => {
+    const video = document.querySelector("video");
+    return window.playerSeekFixture.renderedSources.includes("https://media.fixture.invalid/hevc-991-2.m3u8") &&
+      video.currentTime > 0 && !video.paused && video.readyState >= 3;
+  });
+  await page.locator("video").evaluate(v => v.pause());
+  await page.evaluate(() => window.playerSeekFixture.setBuffer(document.querySelector("video").currentTime + 9));
+  await page.waitForFunction(() => window.playerSeekFixture.commands.some(c => c.command === "warmup" && c.url === "https://media.fixture.invalid/hevc-992-1.m3u8"));
+  // Switching source during the debounce cancels the old timer, not the next source.
+  const slider = page.getByRole("slider", { name: "播放进度" });
+  const before = await page.evaluate(() => window.playerSeekFixture.commands.length);
+  const sliderBox = await slider.boundingBox(); assert(sliderBox);
+  await page.mouse.move(sliderBox.x + sliderBox.width * .8, sliderBox.y + sliderBox.height / 2);
+  await page.mouse.down();
+  await page.evaluate(() => window.playerSeekFixture.setSource(993));
+  await page.waitForFunction(() => window.playerSeekFixture.commands.some(c => c.command === "session_ready" && c.active && c.url === "https://media.fixture.invalid/hevc-993-1.m3u8"));
+  await page.waitForTimeout(200);
+  const after = await page.evaluate(n => window.playerSeekFixture.commands.slice(n), before);
+  assert(after.some(c => c.command === "session" && !c.active && c.url === "https://media.fixture.invalid/hevc-991-2.m3u8"), "Old source must close its raw playlist session");
+  assert(!after.some(c => c.command === "prefetch"), "Source change must clear the old preview debounce");
+  await page.mouse.up();
+  const priorPlayCount = await page.evaluate(() => window.playerSeekFixture.commands.filter(c => c.command === "play" && c.id === 991 && c.ep === 2).length);
+  await page.evaluate(() => { window.playerSeekFixture.renderedSources.length = 0; window.playerSeekFixture.expirePlayUrls(); window.playerSeekFixture.setSource(991); });
+  await page.waitForFunction(n => window.playerSeekFixture.commands.filter(c => c.command === "play" && c.id === 991 && c.ep === 2).length > n, priorPlayCount);
+  // 即使探测宣称支持，实际 addSourceBuffer codec 拒绝也只回落本集，不篡改用户偏好。
+  await page.waitForFunction(() => window.playerSeekFixture.renderedSources.includes("https://media.fixture.invalid/hevc-991-2.m3u8"));
+  const recoveries = await page.evaluate(() => window.playerSeekFixture.codecRecoveries);
+  await page.evaluate(() => window.playerSeekFixture.failCodec());
+  await page.waitForFunction(() => window.playerSeekFixture.renderedSources.includes("https://media.fixture.invalid/list-991-2.m3u8"));
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.codecRecoveries), recoveries, "Codec capability rejection must not loop recoverMediaError");
+  assert(await page.evaluate(() => window.playerSeekFixture.preferHevc), "Per-key codec fallback must preserve the user's HEVC preference");
+  // 新页面显式模拟无 HEVC 的 MSE，保持 preferHevc=true，主播放/预热都应使用标准。
+  await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&optimization=1&hevc=unsupported&proxy=${encodeURIComponent(report.media)}`);
+  await page.waitForFunction(() => window.playerSeekFixture.renderedSources.includes("https://media.fixture.invalid/list-991-1.m3u8"));
+  assert(await page.evaluate(() => window.playerSeekFixture.preferHevc), "Unsupported device must retain persisted HEVC preference");
+  await page.evaluate(() => window.playerSeekFixture.setBuffer(document.querySelector("video").currentTime + 9));
+  await page.waitForFunction(() => window.playerSeekFixture.commands.some(c => c.command === "warmup" && c.url === "https://media.fixture.invalid/list-991-2.m3u8"));
+  assert(!(await page.evaluate(() => window.playerSeekFixture.commands)).some(c => (c.command === "session" || c.command === "warmup") && c.url?.includes("/hevc-")), "Unsupported HEVC must never enter playback or warmup");
+  // HEVC 不支持但 AVC fixture 确实是 320x180；画质和编码分别按实际观测展示。
+  await page.waitForFunction(() => [...document.querySelectorAll('button[aria-label="画质切换"]')].some(b => b.textContent.includes('180p')));
+  const qualities = await page.getByRole("button", { name: "画质切换", exact: true }).all();
+  assert(qualities.length > 0, "Quality indicator must exist");
+  for (const quality of qualities) {
+    assert.equal(await quality.getAttribute("aria-pressed"), "false", "Quality UI must indicate effective standard playback");
+    assert.match(await quality.textContent(), /180p/, "Resolution must match decoded pixels, not codec preference");
+    assert.match(await quality.textContent(), /AVC/, "Codec must reflect the actual AVC fixture");
+  }
+  return { feed_cache_expiry: true, ...units, warmup_gate: true, single_next_target: true, warmup_retry: true, hevc_target: true, next_video_fallback: true, buffered_seek_preserved_loader: true, source_cleanup: true, unsupported_hevc_fallback: true, codec_error_no_recovery_loop: true, hevc_preference_preserved: true };
+}
+async function mobileCheck(page) {
+  await loadPlayer(page, false, "&mobile=1&optimization=1");
+  await page.evaluate(() => window.playerSeekFixture.setLogging(true));
+  const commands = () => page.evaluate(() => window.playerSeekFixture.commands);
+  const gesture = page.getByTestId("mobile-video-gesture");
+  const r = await gesture.boundingBox(); assert(r);
+  const before = (await commands()).length;
+  await page.mouse.move(r.x + r.width * .25, r.y + r.height * .35);
+  await page.mouse.down();
+  await page.mouse.move(r.x + r.width * .35, r.y + r.height * .35);
+  await page.mouse.move(r.x + r.width * .55, r.y + r.height * .35);
+  await page.waitForFunction(n => window.playerSeekFixture.commands.slice(n).some(c => c.command === "prefetch"), before);
+  assert.equal((await getLogs(page)).filter(e => e.event === "seek.request").length, 0, "Mobile horizontal drag must only preview before release");
+  await page.mouse.up();
+  await page.waitForFunction(() => window.playerSeekFixture.logs.some(e => e.event === "seek.request" && e.data.source === "mobile_gesture"));
+  assert(!(await commands()).slice(before).some(c => c.command === "cancel"), "Horizontal release must preserve same-fragment handoff");
+  const bar = page.getByTestId("mobile-seekbar").first();
+  const b = await bar.boundingBox(); assert(b);
+  const barBefore = (await commands()).length;
+  await page.mouse.move(b.x + b.width * .2, b.y + b.height / 2); await page.mouse.down();
+  await page.mouse.move(b.x + b.width * .7, b.y + b.height / 2);
+  await page.waitForFunction(n => window.playerSeekFixture.commands.slice(n).some(c => c.command === "prefetch"), barBefore);
+  const seeksBefore = (await getLogs(page)).filter(e => e.event === "seek.request").length;
+  await bar.dispatchEvent("pointercancel", { pointerId: 1 });
+  await page.mouse.up();
+  assert((await commands()).slice(barBefore).some(c => c.command === "cancel" && c.url?.endsWith(".ts")), "Mobile bar cancellation must cancel matching server speculation");
+  assert.equal((await getLogs(page)).filter(e => e.event === "seek.request").length, seeksBefore, "Cancelled bar must not commit a seek");
+  const activeBefore = (await commands()).length;
+  await page.mouse.move(b.x + b.width * .3, b.y + b.height / 2); await page.mouse.down();
+  await page.mouse.move(b.x + b.width * .6, b.y + b.height / 2);
+  await page.waitForFunction(n => window.playerSeekFixture.commands.slice(n).some(c => c.command === "prefetch"), activeBefore);
+  await page.evaluate(() => window.playerSeekFixture.setActive(false));
+  await page.mouse.up();
+  await page.waitForFunction(n => window.playerSeekFixture.commands.slice(n).some(c => c.command === "cancel"), activeBefore);
+  assert((await commands()).slice(activeBefore).some(c => c.command === "session" && c.active === false), "Mobile inactive state must end the server session");
+  return { horizontal_preview: true, release_handoff: true, bar_cancel: true, inactive_cancel: true };
+}
+
 async function lifecycleCheck(page) {
   const feed = await lifecyclePlayerCheck(page, false);
   const legacy = await lifecyclePlayerCheck(page, true);
-  // The video mounts after the parent's inactive effect, just like a late API response.
+  // Inactive Feed now defers the play API entirely, so no decoder needs to mount.
   await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&inactive=1&proxy=${encodeURIComponent(report.media)}`);
-  await page.waitForFunction(() => document.querySelector("video") && window.playerSeekFixture.engineState().levels > 0);
+  await page.waitForFunction(() => window.playerSeekFixture && document.querySelector('.player-root'));
   await page.waitForTimeout(350);
-  assert(await page.locator("video").evaluate(v => v.paused), "Late-mounted inactive player must not autoplay");
-  assert.equal(await page.evaluate(() => window.playerSeekFixture.engineState().loading), false);
-  return { feed, legacy, late_mount_paused: true };
+  assert(await page.evaluate(() => !document.querySelector('video') || document.querySelector('video').paused), 'Inactive Feed must not autoplay');
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.commands.filter(c => ['play', 'warmup', 'prepare', 'related'].includes(c.command)).length), 0, 'Inactive Feed must not start business/media preparation');
+  assert.notEqual(await page.evaluate(() => window.playerSeekFixture.engineState().loading), true);
+  await page.evaluate(() => window.playerSeekFixture.setActive(true));
+  await page.waitForFunction(() => { const v = document.querySelector('video'); return v && !v.paused && v.currentTime > .5; });
+  return { feed, legacy, inactive_requests: 0, late_activation_playing: true };
 }
 
 try {
@@ -280,7 +438,7 @@ try {
   if (!mediaDir) {
     temporaryMedia = await mkdtemp(join(tmpdir(), "hghub-playback-")); mediaDir = temporaryMedia;
     try {
-      execFileSync(process.env.FFMPEG_PATH || "ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=15", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "90", "-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-sc_threshold", "0", "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_segment_filename", join(mediaDir, "seg%03d.ts"), join(mediaDir, "list.m3u8")], { timeout: 60000, stdio: "pipe" });
+      execFileSync(process.env.FFMPEG_PATH || "ffmpeg", ["-hide_banner", "-loglevel", "error", "-filter_threads", "1", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=15", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "90", "-c:v", "libx264", "-threads", "1", "-preset", "ultrafast", "-g", "30", "-sc_threshold", "0", "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod", "-hls_segment_filename", join(mediaDir, "seg%03d.ts"), join(mediaDir, "list.m3u8")], { timeout: 60000, stdio: "pipe" });
     } catch { throw new Error("Cannot generate HLS fixture: install FFmpeg (libx264/AAC), set FFMPEG_PATH, or pass --media-dir DIR"); }
   }
   vite = await createViteServer({ root, server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false, open: false } });
@@ -290,7 +448,7 @@ try {
   report.browser_version = browser.version();
   for (const name of scenarios) {
     const dir = join(output, name); await mkdir(dir);
-    const context = await browser.newContext({ viewport: { width: 1000, height: 900 } });
+    const context = await browser.newContext({ viewport: { width: 1000, height: 900 }, ...(name === "mobile" ? { userAgent: "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36", hasTouch: true, isMobile: true } : {}) });
     await context.exposeBinding("collectPlaybackLogs", (_source, entries) => {
       for (const e of entries) jsonl(join(dir, "playback.jsonl"), { ts: e.data.at, event: `web.${e.event}`, data: e.data, transport: "browser-fixture" });
     });
@@ -312,14 +470,19 @@ try {
     const result = { name, status: "running", started: new Date().toISOString() }; report.cases.push(result);
     let deadline;
     try {
-      const action = name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
+      const action = name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : name === "optimization" ? optimizationCheck(page) : name === "mobile" ? mobileCheck(page) : lifecycleCheck(page);
       result.metrics = await Promise.race([action, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("Scenario exceeded 45 seconds")), 45000); })]);
       assert.deepEqual(pageErrors, [], "Browser script errors");
       assert.deepEqual(externalRequests, [], "Unexpected external network requests");
       result.status = "passed"; console.log(`PASS ${name}: ${JSON.stringify(result.metrics)}`);
     } catch (error) {
-      result.status = "failed"; result.error = error.message;
-      console.error(`FAIL ${name}: ${error.message}`);
+      result.status = "failed"; result.error = error.message; result.stack = error.stack;
+      result.fixture_state = await page.evaluate(() => ({
+        media: [...document.querySelectorAll('video')].map(v => ({ time: v.currentTime, ready: v.readyState, paused: v.paused, error: v.error?.code })),
+        commands: window.playerSeekFixture?.commands?.slice(-25),
+        last_logs: window.playerSeekFixture?.logs?.slice(-15),
+      })).catch(() => null);
+      console.error(`FAIL ${name}: ${error.stack || error.message}`);
     } finally {
       clearTimeout(deadline);
       await getLogs(page).catch(() => {});

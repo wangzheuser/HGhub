@@ -1,2 +1,14 @@
 <!doctype html><meta charset="utf-8"><div id="root"></div>
+<!-- isTauri 在 api.ts 模块求值时就定型，必须先于测试模块注入 IPC 替身；
+     测试模块 body 里的 Object.assign 会用带请求队列的替身覆盖这里的基础版 -->
+<script>
+  window.__TAURI_INTERNALS__ = {
+    transformCallback(callback) { return callback; },
+    invoke(cmd) {
+      if (cmd === "app_boot") return Promise.resolve({ user: null, logged_in: false, base: "https://fixture.invalid" });
+      if (cmd === "debug_log") return Promise.resolve();
+      return Promise.resolve(null);
+    },
+  };
+</script>
 <script type="module" src="/tests/api-loading.tsx"></script>

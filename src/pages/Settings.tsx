@@ -24,11 +24,18 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
   const [updating, setUpdating] = useState("");
   const playbackLog = usePlaybackLog();
   const [copyingLog, setCopyingLog] = useState(false);
+  /** 缓存体系状态快照（内存/磁盘两级缓存的条数与体积） */
+  const [cacheInfo, setCacheInfo] = useState<Awaited<ReturnType<typeof api.cacheStats>>>(null);
+
+  const readCacheStats = () => {
+    api.cacheStats().then((s) => setCacheInfo(s)).catch(() => {});
+  };
 
   const readLine = () => {
     api.lineState().then((s) => setLineBase(s.base)).catch(() => {});
   };
   useEffect(readLine, []);
+  useEffect(readCacheStats, []);
   useEffect(() => { void initPlaybackLog(); }, []);
 
   const checkUpdate = async () => {
@@ -133,6 +140,17 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <div className="flex-1">
                 <div className="text-[12.5px] text-on">本地喜欢</div>
                 <div className="text-[10.5px] text-mut">{favs.length} 部收藏 · {history.length} 条观看记录</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 px-3.5 py-3">
+              <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IRefresh size={15} /></span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[12.5px] text-on">播放缓存</div>
+                <div className="text-[10.5px] text-mut">
+                  {cacheInfo
+                    ? `内存 ${cacheInfo.mem_segments}/${cacheInfo.limits.mem_segments_max} 片 · 磁盘 ${cacheInfo.disk_files} 片 / ${(cacheInfo.disk_bytes / 1024 / 1024).toFixed(0)}MB（上限 ${(cacheInfo.limits.disk_bytes_max / 1024 / 1024).toFixed(0)}MB）`
+                    : "统计不可用（浏览器模式）"}
+                </div>
               </div>
             </div>
             <button onClick={() => setClearOpen(true)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable">
@@ -328,6 +346,7 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               try { await api.clearCache(); } catch { /* 忽略 */ }
               setClearing(false);
               setClearOpen(false);
+              readCacheStats();
               toast("缓存已清理", "ok");
             }} className="flex-1 h-9 rounded-(--r-ctl) bg-primary text-[12.5px] font-semibold text-on-primary pressable disabled:opacity-60">
               {clearing ? "清理中…" : "确定清理"}

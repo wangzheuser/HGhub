@@ -1,10 +1,12 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
-import { fmtTime, platform, playlist } from "../api";
+import { api, fmtTime, platform, playlist } from "../api";
 import { mediaErrorMessage } from "../mediaErrors";
 import { mediaHost, mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
 import { usePlaybackActivity } from "../usePlaybackActivity";
+import { installHlsRecovery } from "../playbackRecovery";
 import { useSeekInput } from "../useSeekInput";
+import { createSeekPrefetch, isTimeBuffered, originalMediaUrl } from "../seekPrefetch";
 import PlaybackLock from "./PlaybackLock";
 import { ICompress, IExpand, ILockF, IPauseF, IPlayF, IVol, IVolMute } from "../icons";
 
@@ -31,9 +33,25 @@ export default function Player({
   const videoRef = useRef<HTMLVideoElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const recoverCountRef = useRef(0);
+  const [retryEpoch, setRetryEpoch] = useState(0);
+  const terminalRef = useRef(false);
+  const retryPosition = useRef<{ src: string; time: number; rate: number; wanted: boolean } | null>(null);
+  const recoveryControl = useRef<ReturnType<typeof installHlsRecovery> | null>(null);
+  const seekPrefetch = useMemo(() => createSeekPrefetch(() => hlsRef.current), []);
+  useEffect(() => { if (active) recoveryControl.current?.sync(); else recoveryControl.current?.suspend(); }, [active]);
   const { trace, requestSeek } = usePlayerDiagnostics(videoRef, hlsRef, { view: "post_detail", ...diagnosticContext, active, resource: mediaResource(src) });
-  const activity = usePlaybackActivity(videoRef, hlsRef, { active, autoPlay: !!autoPlay, src, trace });
+  const [session, setSession] = useState({ src: "", active: false });
+  const sessionReady = useRef<Promise<void>>(Promise.resolve());
+  const activity = usePlaybackActivity(videoRef, hlsRef, { active: active && session.src === src && session.active, autoPlay: !!autoPlay, src, trace });
+  useEffect(() => {
+    if (!src) return;
+    let alive = true;
+    const url = originalMediaUrl(src);
+    sessionReady.current = api.mediaSession(url, active).then(() => { if (alive) setSession({ src, active }); });
+    void sessionReady.current.catch(() => { if (alive) setErrMsg("播放会话确认失败，请重试"); });
+    if (!active) seekPrefetch.cancel();
+    return () => { alive = false; seekPrefetch.cancel(); void api.mediaSession(url, false).catch(() => {}); };
+  }, [src, active, seekPrefetch, retryEpoch]);
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [time, setTime] = useState(0);
@@ -43,14 +61,22 @@ export default function Player({
   const [errMsg, setErrMsg] = useState<string>("");
   const [controlsLocked, setControlsLocked] = useState(false);
   const seek = useSeekInput({ time, duration, enabled: active && !controlsLocked, resetKey: src,
-    onInteraction: (phase, input, target, pointerTarget) => trace(`seek.input.${phase}`, { input, target, pointer_target: pointerTarget }),
+    onInteraction: (phase, input, target, pointerTarget) => {
+      trace(`seek.input.${phase}`, { input, target, pointer_target: pointerTarget });
+      // 拖动/点击预览阶段就推测预取目标分片：松手后大概率已命中缓存或已在下载
+      if (phase === "change" && activity.isActive()) seekPrefetch.at(target);
+      if (phase === "cancel") seekPrefetch.cancel();
+    },
     onSeek: (target, input) => {
       const video = videoRef.current;
       if (!video || !activity.isActive()) return;
       requestSeek(target, `legacy_${input}`);
-      setWaiting(true);
-      if (hlsRef.current) {
-        try { hlsRef.current.startLoad(target); } catch { /* ignore */ }
+      seekPrefetch.commit(target);
+      const buffered = isTimeBuffered(video, target);
+      setWaiting(!buffered);
+      const hls = hlsRef.current;
+      if (hls && (!buffered || !hls.loadingEnabled || !hls.bufferingEnabled)) {
+        try { hls.startLoad(target); } catch { /* ignore */ }
       }
       video.currentTime = target;
       trace("seek.assigned", { target });
@@ -63,7 +89,38 @@ export default function Player({
     if (!video || !src) return;
     setErrMsg("");
     setWaiting(false);
-    recoverCountRef.current = 0;
+    let disposed = false;
+    const saved = retryPosition.current?.src === src ? retryPosition.current : null;
+    retryPosition.current = null;
+    if (saved) activity.restoreWanted(saved.wanted);
+    video.playbackRate = saved?.rate ?? rate;
+    const restorePosition = () => {
+      if (!saved) return;
+      video.playbackRate = saved.rate;
+      if (saved.time > 0) video.currentTime = Number.isFinite(video.duration) ? Math.min(saved.time, Math.max(0, video.duration - .15)) : saved.time;
+      trace("source.restored", { target: saved.time, rate: saved.rate, play_wanted: saved.wanted });
+    };
+    video.addEventListener("loadedmetadata", restorePosition);
+    const sourceStarted = performance.now();
+    let firstFrame: number | undefined;
+    let rendered = false;
+    const reportFirstFrame = (method: string, mediaTime: number) => {
+      if (disposed || rendered || !activity.isActive()) return;
+      rendered = true;
+      stopRecovery?.sync();
+      trace("source.firstframe", { method, frame_time: mediaTime, elapsed_ms: Math.round(performance.now() - sourceStarted) });
+    };
+    if (video.requestVideoFrameCallback) {
+      const frame: VideoFrameRequestCallback = (_now, metadata) => {
+        reportFirstFrame("video_frame", metadata.mediaTime);
+        if (!disposed && !rendered) firstFrame = video.requestVideoFrameCallback(frame);
+      };
+      firstFrame = video.requestVideoFrameCallback(frame);
+    }
+    const fallbackFrame = () => { if (!video.requestVideoFrameCallback) reportFirstFrame("playing_fallback", video.currentTime); };
+    video.addEventListener("playing", fallbackFrame);
+    terminalRef.current = false;
+    let stopRecovery: ReturnType<typeof installHlsRecovery> | undefined;
     const url = playlist(src);
     trace("source.load", { engine: Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay, resource: mediaResource(src), host: mediaHost(src) });
 
@@ -90,63 +147,53 @@ export default function Player({
         nudgeMaxRetry: 6,
         manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 4,
-        fragLoadingTimeOut: 15000,
-        fragLoadingMaxRetry: 6,
+        fragLoadingTimeOut: 45000,
+        fragLoadingMaxRetry: 2,
         fragLoadingRetryDelay: 400,
         maxFragLookUpTolerance: 0.25,
       });
       hlsRef.current = hls;
       observeHls(hls, trace);
-      hls.loadSource(url);
-      hls.attachMedia(video);
+      void sessionReady.current.then(() => {
+        if (disposed) return;
+        hls.loadSource(url);
+        hls.attachMedia(video);
+      }).catch(() => {});
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (activity.isActive()) hls.startLoad();
+        if (activity.isActive()) hls.startLoad(saved?.time ?? -1);
         if (autoPlay) activity.play("manifest_autoplay", true);
       });
-      hls.on(Hls.Events.FRAG_BUFFERED, () => {
-        recoverCountRef.current = 0;
-        setErrMsg("");
+      stopRecovery = installHlsRecovery(hls, { active: activity.isActive, time: () => video.currentTime, trace,
+        bufferedStall: { media: video, wanted: activity.playWanted, rendered: () => rendered },
+        beforeTerminate: () => { retryPosition.current = { src, time: video.currentTime, rate: video.playbackRate, wanted: activity.playWanted() }; },
+        terminal: message => {
+          terminalRef.current = true; seekPrefetch.cancel();
+          if (hlsRef.current === hls) hlsRef.current = null;
+          setWaiting(false); setPlaying(false); setErrMsg(message);
+        },
       });
-      hls.on(Hls.Events.ERROR, (_e, data) => {
-        if (!data.fatal) {
-          if (
-            data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
-            data.details === Hls.ErrorDetails.FRAG_LOAD_ERROR
-          ) {
-            try { hls.startLoad(video.currentTime || -1); } catch { /* ignore */ }
-          }
-          return;
-        }
-        if (!activity.isActive()) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && recoverCountRef.current < 4) {
-          recoverCountRef.current += 1;
-          try { hls.startLoad(video.currentTime || -1); } catch { /* ignore */ }
-          return;
-        }
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && recoverCountRef.current < 4) {
-          recoverCountRef.current += 1;
-          try { hls.recoverMediaError(); video.play().catch(() => {}); } catch { /* ignore */ }
-          return;
-        }
-        const detail = `${data.type}/${data.details}/${data.response?.code ?? ""}/${String(data.reason ?? "").slice(0, 80)}`;
-        (window as unknown as { __hlsErr?: string }).__hlsErr = detail;
-        setErrMsg(detail);
-        if (!activity.isActive()) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-        else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-        else { hls.destroy(); hlsRef.current = null; }
-      });
+      recoveryControl.current = stopRecovery;
     } else {
       // Safari / 部分 WebView 原生支持 HLS
-      video.src = url;
-      if (autoPlay) activity.play("native_autoplay", true);
+      void sessionReady.current.then(() => {
+        if (disposed) return;
+        video.src = url;
+        if (autoPlay) activity.play("native_autoplay", true);
+      }).catch(() => {});
     }
 
     return () => {
+      disposed = true;
+      video.removeEventListener("playing", fallbackFrame);
+      video.removeEventListener("loadedmetadata", restorePosition);
+      if (firstFrame !== undefined) video.cancelVideoFrameCallback?.(firstFrame);
+      stopRecovery?.();
+      if (recoveryControl.current === stopRecovery) recoveryControl.current = null;
       trace("source.cleanup");
+      seekPrefetch.cancel();
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     };
-  }, [src, autoPlay]);
+  }, [src, autoPlay, retryEpoch]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -171,6 +218,7 @@ export default function Player({
     const video = videoRef.current;
     if (!video) return;
     trace("toggle.request");
+    if (terminalRef.current) return;
     if (video.paused) activity.play("toggle");
     else activity.pause("toggle");
   };
@@ -207,13 +255,17 @@ export default function Player({
         onPlay={() => { if (activity.isActive()) { setPlaying(true); onTogglePlay?.(true); } }}
         onPause={() => { setPlaying(false); onTogglePlay?.(false); }}
         onWaiting={() => setWaiting(true)}
-        onPlaying={() => { if (activity.isActive()) { setWaiting(false); setErrMsg(""); onPlaying?.(); } }}
+        onPlaying={() => { if (activity.isActive()) { setPlaying(true); setWaiting(false); setErrMsg(""); onPlaying?.(); } }}
         onSeeked={() => setWaiting(false)}
         onTimeUpdate={(e) => setTime((e.target as HTMLVideoElement).currentTime)}
-        onLoadedMetadata={(e) => setDuration((e.target as HTMLVideoElement).duration || 0)}
+        onLoadedMetadata={(e) => {
+          setDuration((e.target as HTMLVideoElement).duration || 0);
+          if (!hlsRef.current && autoPlay) activity.play("native_metadata", true);
+        }}
         onEnded={() => { if (activity.isActive()) onEnded?.(); }}
         onError={() => {
-          if (hlsRef.current) return;
+          if (hlsRef.current || terminalRef.current) return;
+          terminalRef.current = true;
           setWaiting(false);
           setPlaying(false);
           setErrMsg(mediaErrorMessage(videoRef.current?.error ?? null));
@@ -223,6 +275,7 @@ export default function Player({
       {errMsg && (
         <div className="absolute left-2 top-2 z-30 max-w-[80%] rounded bg-black/70 px-2 py-1 text-[10px] leading-tight text-red-300 break-all">
           {errMsg}
+          <button type="button" className="ml-2 underline" onClick={() => { activity.restoreWanted(true); setRetryEpoch(epoch => epoch + 1); }}>重试</button>
         </div>
       )}
 

@@ -114,6 +114,7 @@ const engines = new WeakMap<Hls, string>();
 export function mediaSnapshot(v: HTMLVideoElement, hls?: Hls | null) {
   return { time: round(v.currentTime), duration: round(v.duration), paused: v.paused, seeking: v.seeking, ready: v.readyState, network: v.networkState,
     buffered: ranges(v.buffered), seekable: ranges(v.seekable), muted: v.muted, volume: v.volume, rate: v.playbackRate,
+    video_width: v.videoWidth, video_height: v.videoHeight,
     buffering_enabled: hls?.bufferingEnabled, loading_enabled: hls?.loadingEnabled, media_error: v.error?.code ?? null,
     engine: hls ? engines.get(hls) : "native", prefer_managed: hls?.config.preferManagedMediaSource,
     visible: getComputedStyle(v).visibility !== "hidden" && v.getClientRects().length > 0 };
@@ -151,6 +152,7 @@ export function usePlayerDiagnostics(videoRef: RefObject<HTMLVideoElement | null
     let frame: number | undefined;
     let lastHeartbeat = 0;
     let timeoutReported = 0;
+    let lastQuality: { total: number; dropped: number } | undefined;
     const emit = (event: string, data: Data = {}) => {
       if (playbackLogEnabled()) {
         try { tracePlayback(event, { player: id.current, ...current.current, ...mediaSnapshot(v, hlsRef.current), ...data }); } catch { /* detached or changing ranges */ }
@@ -191,7 +193,20 @@ export function usePlayerDiagnostics(videoRef: RefObject<HTMLVideoElement | null
         timeoutReported = p.id;
         emit("seek.timeout", { seek: p.id, target: round(p.target), elapsed_ms: Math.round(performance.now() - p.start) });
       }
-      if (performance.now() - lastHeartbeat >= 5000) { lastHeartbeat = performance.now(); emit("player.heartbeat"); }
+      if (performance.now() - lastHeartbeat >= 5000) {
+        lastHeartbeat = performance.now(); emit("player.heartbeat");
+        if (current.current.active && !v.paused) {
+          const quality = v.getVideoPlaybackQuality?.();
+          if (quality) {
+            const total = quality.totalVideoFrames, dropped = quality.droppedVideoFrames;
+            const delta = lastQuality && total >= lastQuality.total ? total - lastQuality.total : 0;
+            const droppedDelta = lastQuality && dropped >= lastQuality.dropped ? dropped - lastQuality.dropped : 0;
+            emit("quality.sample", { total_frames: total, dropped_frames: dropped, interval_frames: delta, interval_dropped: droppedDelta,
+              dropped_ratio: delta > 0 ? droppedDelta / delta : null });
+            lastQuality = { total, dropped };
+          }
+        }
+      }
     }, 1000);
     emit("player.mount");
     return () => {

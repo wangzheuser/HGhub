@@ -39,7 +39,7 @@ echo    更新检查            https://api.github.com/repos/zxsos/HGhub/release
 echo.
 echo  [说明] 播放与选线的实时 URL 由下方最小化的 HGhub-debug-log
 echo         窗口输出（play / hls / seg / line 各行）；关闭主窗口后
-echo         该日志窗口需手动关闭。
+echo         该日志窗口会自动关闭。
 echo.
 
 rem 局域网 IP 检测（192.168 优先；通配符必须带引号，否则 PowerShell 脚本块内解析报错）
@@ -68,7 +68,22 @@ if not exist node_modules (
 
 rem 编码说明: 本文件保存为 UTF-8（无 BOM），第 2 行 chcp 65001 切换控制台代码页；勿删 chcp 行，否则中文乱码
 rem 独立窗口实时跟踪应用日志：输出所有 play / hls / seg / line 访问 URL
-start "HGhub-debug-log" /min powershell -NoProfile -Command "while(-not (Test-Path '%APPLOG%')){ Start-Sleep -Milliseconds 500 }; Get-Content '%APPLOG%' -Wait -Tail 50"
+rem 先清扫历史遗留的日志跟踪窗口（排除自身进程，避免误杀）
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'Name=''powershell.exe''' | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*Get-Content*com.hghub.huangguo*debug.log*Wait*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+rem 启动新日志跟踪窗口并记录其 PID，供应用退出后自动关闭
+set "TAILPIDFILE=%TEMP%\hghub_tail_pid.txt"
+del "%TAILPIDFILE%" 2>nul
+start "HGhub-debug-log" /min powershell -NoProfile -Command "$PID | Out-File '%TAILPIDFILE%' -Encoding ascii; while(-not (Test-Path '%APPLOG%')){ Start-Sleep -Milliseconds 500 }; Get-Content '%APPLOG%' -Wait -Tail 50"
+set /a TAILWAIT=0
+:wait_tailpid
+if exist "%TAILPIDFILE%" goto tailpid_ok
+set /a TAILWAIT+=1
+if %TAILWAIT% lss 20 (
+    ping -n 1 127.0.0.1 >nul
+    goto wait_tailpid
+)
+:tailpid_ok
+if exist "%TAILPIDFILE%" set /p TAILPID=<"%TAILPIDFILE%"
 
 if not exist dist (
     echo [setup] 未找到 dist 产物，正在为页面入口构建……
@@ -79,10 +94,27 @@ if not exist dist (
         exit /b 1
     )
 )
-echo [run] pnpm app:dev  （关闭应用窗口即退出；Ctrl+C 可中断）
-call pnpm app:dev
+rem --prebuilt 复用刚验证过的本地 debug 程序，仅启动 Vite，不触发重复 Rust 编译。
+rem 本机健康探针显式绕过系统代理，避免 localhost 被代理造成假超时。
+rem 修改 Rust 后须先 cargo build；默认启动方式保持不变。
+if /I "%~1"=="--prebuilt" (
+    if not exist src-tauri\target\debug\huangguo-client.exe (
+        echo [error] 未找到本地 debug 程序，请先运行 cargo build --manifest-path src-tauri/Cargo.toml -j 1
+        exit /b 1
+    )
+    echo [run] 已构建程序 + Vite（关闭桌面窗口时自动停止本次 Vite）
+    powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; $result = 1; $vite = Start-Process -FilePath 'node' -ArgumentList 'node_modules/vite/bin/vite.js' -WorkingDirectory '%~dp0' -PassThru; try { $deadline = (Get-Date).AddSeconds(15); while ($true) { if ($vite.HasExited) { throw 'Vite 启动失败' }; try { $probe = [Net.WebRequest]::Create('http://localhost:1420/'); $probe.Proxy = $null; $probe.Timeout = 1000; $response = $probe.GetResponse(); $ready = [int]$response.StatusCode -eq 200; $response.Close(); if ($ready) { break } } catch {}; if ((Get-Date) -gt $deadline) { throw 'Vite 启动超时' }; Start-Sleep -Milliseconds 150 }; Push-Location '%~dp0src-tauri'; .\target\debug\huangguo-client.exe; $result = $LASTEXITCODE; Pop-Location } finally { if (-not $vite.HasExited) { Stop-Process -Id $vite.Id -Force -ErrorAction SilentlyContinue } }; exit $result"
+) else (
+    echo [run] pnpm app:dev  （关闭应用窗口即退出；Ctrl+C 可中断）
+    call pnpm app:dev
+)
+set "RUNEXIT=%errorlevel%"
+
+rem 应用退出后自动关闭日志跟踪窗口（Ctrl+C 强退时来不及执行，下次启动的清扫会兜底）
+if defined TAILPID taskkill /PID %TAILPID% /F >nul 2>&1
+del "%TAILPIDFILE%" 2>nul
 
 echo.
-echo [exit] HGhub dev 已退出。
+echo [exit] HGhub dev 已退出，日志跟踪窗口已自动关闭。
 pause
-endlocal
+endlocal & exit /b %RUNEXIT%

@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { tracePlayback } from "./playbackDiagnostics";
+import { createMediaSessionQueue } from "./mediaSessionQueue";
+import { canonicalWarmupTarget } from "./mediaWarmupIdentity";
 import type {
   CommentPage, Detail, HotWord, Paged, PlayInfo, Post, PostCategory, RankItem, TagGroup, TopicCard, TopicDetail, User, UserProfile, VideoCard,
 } from "./types";
@@ -125,6 +127,11 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   const once = () => rawCall<T>(cmd, args);
   try {
     const r = await once();
+    if (["api_login", "api_logout", "api_register", "line_set"].includes(cmd) ||
+      (cmd === "line_auto" && (r as { switched?: boolean })?.switched) ||
+      (cmd === "line_try_main" && (r as { switched?: boolean })?.switched)) {
+      playRequests.clear(); detailRequests.clear();
+    }
     notifyNet({ ok: true, cmd });
     return r;
   } catch (e) {
@@ -157,6 +164,79 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     }
     throw new Error(failMessage(msg, status));
   }
+}
+
+/** 播放地址短期复用：预取与主播放共享在途 Promise，过期/失败后才重新请求。 */
+const playRequests = new Map<string, { promise: Promise<PlayInfo>; expires: number }>();
+export const PLAY_URL_TTL = 60_000;
+let foregroundPlayRequests = 0;
+export const hasForegroundPlayRequest = () => foregroundPlayRequests > 0;
+const enqueueMediaSession = createMediaSessionQueue((url, active) => rawCall<void>("media_session", { url, active }));
+let desiredMediaRoot = "";
+function sendMediaSession(url: string, active: boolean): Promise<void> {
+  if (active) desiredMediaRoot = url;
+  else if (desiredMediaRoot === url) desiredMediaRoot = "";
+  return enqueueMediaSession(url, active);
+}
+function cancelWarmup(url: string): Promise<void> {
+  // cleanup 的精确取消也让出同 tick 已被提升为当前源的目标（跨组件交接）。
+  return Promise.resolve().then(() => {
+    if (desiredMediaRoot && canonicalWarmupTarget(url) === canonicalWarmupTarget(desiredMediaRoot)) return;
+    return rawCall<void>("media_warmup_cancel", { url }).catch(() => {});
+  });
+}
+const detailRequests = new Map<number, { promise: Promise<Detail>; expires: number }>();
+function requestDetail(id: number): Promise<Detail> {
+  const cached = detailRequests.get(id);
+  if (cached && cached.expires > Date.now()) return cached.promise;
+  const entry = { promise: null as unknown as Promise<Detail>, expires: Infinity };
+  foregroundPlayRequests += 1;
+  entry.promise = call<Detail>("api_video", { id }).then(detail => {
+    entry.expires = Date.now() + 15_000;
+    return detail;
+  }, error => {
+    if (detailRequests.get(id) === entry) detailRequests.delete(id);
+    throw error;
+  }).finally(() => { foregroundPlayRequests -= 1; });
+  detailRequests.set(id, entry);
+  for (const [key, value] of detailRequests) if (value.expires <= Date.now()) detailRequests.delete(key);
+  // 仅保留少量最近详情；在途请求保留去重，结束后自然进入短 TTL。
+  if (detailRequests.size > 32) for (const [key, value] of detailRequests) {
+    if (detailRequests.size <= 32) break;
+    if (value.expires !== Infinity) detailRequests.delete(key);
+  }
+  return entry.promise;
+}
+
+export type MediaWarmupStatus = {
+  state: "idle" | "queued" | "ready" | "busy" | "cancelled" | "failed";
+  playlist_ready: boolean; segment_ready: boolean; dependencies_ready: boolean;
+  generation: number; reason?: string;
+};
+function requestPlay(id: number, ep: number, speculative = false): Promise<PlayInfo> {
+  const key = `${id}:${ep}`;
+  const cached = playRequests.get(key);
+  if (cached && cached.expires > Date.now()) {
+    if (!speculative && cached.expires === Infinity) {
+      foregroundPlayRequests += 1;
+      return cached.promise.finally(() => { foregroundPlayRequests -= 1; });
+    }
+    return cached.promise;
+  }
+  if (!speculative) foregroundPlayRequests += 1;
+  const entry = { promise: null as unknown as Promise<PlayInfo>, expires: Infinity };
+  entry.promise = call<PlayInfo>("api_play", { id, ep }).then(info => {
+    entry.expires = info?.streams?.main || info?.video_url ? Date.now() + PLAY_URL_TTL : 0;
+    if (!entry.expires && playRequests.get(key) === entry) playRequests.delete(key);
+    return info;
+  }, error => {
+    if (playRequests.get(key) === entry) playRequests.delete(key);
+    throw error;
+  }).finally(() => { if (!speculative) foregroundPlayRequests -= 1; });
+  playRequests.set(key, entry);
+  // TTL 不依赖组件 alive 标记，旧 effect 的结果依然供下一次主请求复用。
+  for (const [k, value] of playRequests) if (value.expires <= Date.now()) playRequests.delete(k);
+  return entry.promise;
 }
 
 /* ── 接口 ───────────────────────────────────────────────── */
@@ -204,8 +284,8 @@ export const api = {
   /** 吃瓜帖视频：详情里 video_url 恒为空，地址由 playback 接口下发（可能多段）。 */
   postPlayback: (id: number) => call<{ mode?: number; videos?: { index: number; url: string }[] }>("api_post_playback", { id }),
 
-  video: (id: number) => call<Detail>("api_video", { id }),
-  play: (id: number, ep: number) => call<PlayInfo>("api_play", { id, ep }),
+  video: requestDetail,
+  play: (id: number, ep: number, speculative = false) => requestPlay(id, ep, speculative),
 
   comments: (id: number, ep: number, page = 1, size = 20) =>
     call<CommentPage>("api_comments", { id, ep, page, size }),
@@ -213,8 +293,29 @@ export const api = {
     call<unknown>("api_comment_send", { id, ep, text, replyId: replyId ?? null }),
 
   clearCache: () => rawCall<void>("cache_clear"),
+  /** 缓存体系状态快照（内存/磁盘两级缓存的条数与体积）；设置页展示用 */
+  cacheStats: () =>
+    rawCall<{
+      mem_segments: number;
+      mem_bytes: number;
+      keys: number;
+      playlists: number;
+      covers: number;
+      disk_files: number;
+      disk_bytes: number;
+      limits: { mem_segments_max: number; disk_bytes_max: number };
+    }>("cache_stats").catch(() => null),
   /** 预热某集首片（切集前调用，让切换时不再等下载）；失败静默，仅加速 */
   mediaWarmup: (url: string) => rawCall<boolean>("media_warmup", { url }).catch(() => false),
+  mediaPrepare: (url: string) => rawCall<boolean>("media_prepare", { url }).catch(() => false),
+  mediaWarmupStatus: (url: string) => rawCall<MediaWarmupStatus>("media_warmup_status", { url }),
+  mediaWarmupCancel: cancelWarmup,
+  /** 拖动/点击进度条时的推测预取：把预览位置的分片提前下载进缓存；失败静默，仅加速 */
+  mediaPrefetch: (url: string) => rawCall<boolean>("media_prefetch", { url }).catch(() => false),
+  /** 仅取消匹配 URL 的旧推测任务，避免旧组件 cleanup 误伤新目标。 */
+  mediaPrefetchCancel: (url?: string) => rawCall<void>("media_prefetch_cancel", url ? { url } : {}).catch(() => {}),
+  /** url 始终是原始播放列表地址；后台按会话隔离预热/预取。 */
+  mediaSession: sendMediaSession,
   netDiag: () => rawCall<Record<string, unknown>>("net_diag"),
   postLike: (id: number, on: boolean) => rawCall<unknown>("api_post_like", { id, on }),
   postCollect: (id: number, on: boolean) => rawCall<unknown>("api_post_collect", { id, on }),

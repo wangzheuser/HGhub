@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { api, cover, fmt, fmtTime, isMobile, isWeb, logLine, mediaUrl } from "../api";
+import { api, cover, fmt, fmtTime, hasForegroundPlayRequest, isMobile, isWeb, logLine, mediaUrl, PLAY_URL_TTL } from "../api";
+import { chooseWarmCandidate, createWarmupScheduler } from "../warmupScheduler";
+import { codecLabel, isCodecFailure, qualityLabel, type PlaybackQuality } from "../playbackQuality";
 import type { Detail, Episode, Post, VideoCard } from "../types";
 import { useStore } from "../store";
 import { Avatar, Img, Sheet } from "./ui";
-import VideoSurface, { type VideoHandle } from "./VideoSurface";
+import VideoSurface, { canPlayHevc, type VideoHandle } from "./VideoSurface";
 import PlayerControls from "./PlayerControls";
 import PlaybackLock from "./PlaybackLock";
 import { ArticlePanel, CommentsPanel, EpisodesPanel } from "./Panels";
@@ -47,6 +49,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [details, setDetails] = useState<Record<number, Detail>>({});
   const [playUrls, setPlayUrls] = useState<Record<string, string>>({});
   const [hevcUrls, setHevcUrls] = useState<Record<string, string>>({});
+  const playResolvedAt = useRef<Record<string, number>>({});
   const [cards, setCards] = useState<Record<number, VideoCard>>({});
   const [posts, setPosts] = useState<Record<number, Post>>({});
   const [related, setRelated] = useState<VideoCard[]>([]);
@@ -59,7 +62,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [controlsLocked, setControlsLocked] = useState(false);
   const [rate, setRate] = useState(1);
   const [waiting, setWaiting] = useState(false);
+  const [seeking, setSeeking] = useState(false);
+  const [firstFrameKey, setFirstFrameKey] = useState("");
+  const [quality, setQuality] = useState<PlaybackQuality>({ width: 0, height: 0, codec: "" });
+  const [direction, setDirection] = useState(1);
+  const [episodeIntent, setEpisodeIntent] = useState<{ id: number; ep: number } | null>(null);
   const [err, setErr] = useState("");
+  const [playRequestEpoch, setPlayRequestEpoch] = useState(0);
   const [panel, setPanel] = useState<"episodes" | "comments" | "article" | "detail" | null>(null);
   const [descOpen, setDescOpen] = useState(false);
   /* 续播：拿到时长后再 seek 一次（只对进入时那一条生效） */
@@ -131,7 +140,16 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const playKey = `${curId}:${curEp}`;
   const mainUrl = playUrls[playKey] || "";
   const hevcUrl = hevcUrls[playKey] || "";
-  const playUrl = preferHevc && hevcUrl ? hevcUrl : mainUrl;
+  const hevcSupported = useMemo(canPlayHevc, []);
+  const [hevcFailures, setHevcFailures] = useState<Record<string, boolean>>({});
+  const effectiveHevc = preferHevc && hevcSupported && !hevcFailures[playKey] && !!hevcUrl;
+  const playUrl = effectiveHevc ? hevcUrl : mainUrl;
+  const toggleQuality = () => {
+    const want = !preferHevc;
+    setPreferHevc(want);
+    toast(!want ? "已选择标准编码流" : !hevcSupported || hevcFailures[playKey]
+      ? "已保留 HEVC 偏好，当前设备使用标准流" : "已选择 HEVC 编码，分辨率以实际视频为准", "info");
+  };
   useEffect(() => { setZoom({ s: 1, x: 0, y: 0, g: false }); pinchRef.current = null; pointersRef.current.clear(); }, [playUrl]);
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
   const episodes = detail?.episodes || [];
@@ -229,6 +247,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const resolveSwipe = useCallback((target: number) => {
     const prev = idxRef.current;
     if (target === prev) return;
+    setDirection(target > prev ? 1 : -1);
+    setEpisodeIntent(null);
     idxRef.current = target;
     setIndex(target);
   }, []);
@@ -255,6 +275,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   /* 统一的上下切换：swipeEp 开启且为多集视频时优先切集，否则切剧。
      桌面端键盘 ↑↓ 与右侧按钮都走这里，和移动端上下划手势保持一致。 */
   const stepDir = useCallback((dir: number) => {
+    setDirection(dir);
+    setEpisodeIntent(null);
     if (swipeEp && kind === "video") {
       const ep = epMap[curId] || 1;
       const total = episodes.length;
@@ -289,43 +311,44 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* 拉详情（当前 + 邻接预取） */
+  /* 当前详情与播放地址并行；失活页不新增业务请求。 */
   useEffect(() => {
+    if (!active || kind !== "video") return;
     let alive = true;
-    const need = [videoIds[index], videoIds[index + 1], videoIds[index - 1]].filter(Boolean);
+    const need = [videoIds[index]].filter(Boolean);
     need.forEach((id) => {
       if (details[id]) return;
       api.video(id).then((d) => { if (alive) setDetails((m) => ({ ...m, [id]: d })); }).catch(() => {});
     });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, videoIds]);
+  }, [active, kind, index, videoIds]);
 
   /* 吃瓜帖子：直接拿帖子详情（含 video_url） */
   useEffect(() => {
-    if (kind !== "post") return;
+    if (!active || kind !== "post") return;
     let alive = true;
-    [videoIds[index], videoIds[index + 1], videoIds[index - 1]].filter(Boolean).forEach((id) => {
+    [videoIds[index]].filter(Boolean).forEach((id) => {
       if (posts[id]) return;
       api.post(id).then((p) => { if (alive) setPosts((m) => ({ ...m, [id]: p })); }).catch(() => {});
     });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kind, index, videoIds]);
+  }, [active, kind, index, videoIds]);
 
-  /* 相关推荐：切到当前视频时拉一次 */
+  /* 首帧前不抢业务连接；用户主动打开详情时可提前请求。 */
+  const relatedId = useRef(0);
   useEffect(() => {
-    if (!curId || kind !== "video") return;
+    if (!active || !curId || kind !== "video" || (firstFrameKey !== playKey && panel !== "detail") || relatedId.current === curId) return;
     let alive = true;
-    api.related(curId).then((r) => { if (alive) setRelated(r?.items || []); }).catch(() => {});
+    api.related(curId).then((r) => { if (alive) { relatedId.current = curId; setRelated(r?.items || []); } }).catch(() => {});
     return () => { alive = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [curId, kind]);
+  }, [active, curId, kind, firstFrameKey, playKey, panel]);
 
   /* 拉播放地址 */
   useEffect(() => {
-    if (!curId) return;
-    if (playUrls[playKey]) return;
+    if (!active || !curId || kind !== "video") return;
+    if (playUrls[playKey] && Date.now() - (playResolvedAt.current[playKey] || 0) < PLAY_URL_TTL) return;
     let alive = true;
     api.play(curId, curEp)
       .then((info) => {
@@ -350,47 +373,64 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           status: raw.status ?? null, msg: String(raw.msg ?? "") || null,
         });
         if (!streamUrl) throw new Error("暂无播放地址");
+        playResolvedAt.current[playKey] = Date.now();
         setPlayUrls((m) => ({ ...m, [playKey]: streamUrl }));
-        if (hevcStream) setHevcUrls((m) => ({ ...m, [playKey]: hevcStream }));
+        setHevcUrls((m) => ({ ...m, [playKey]: hevcStream }));
         addHistory(curId, curEp);
       })
       .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [curId, curEp]);
+  }, [active, kind, curId, curEp, playRequestEpoch]);
 
-  /* 剧集预热：相邻集提前取好播放地址，切集秒开 */
+  const warmCandidate = kind === "video" ? chooseWarmCandidate({
+    id: curId, ep: curEp, episodes: episodes.map(e => e.ep_num), videoIds, index, epMap, swipeEp, direction,
+    intentEp: panel === "episodes" && episodeIntent?.id === curId ? episodeIntent.ep : undefined,
+  }) : null;
+  const warmConfig = useRef({ preferHevc, hevcSupported, hevcFailures, playUrls, hevcUrls });
+  warmConfig.current = { preferHevc, hevcSupported, hevcFailures, playUrls, hevcUrls };
+  const scheduler = useMemo(() => createWarmupScheduler({
+    resolve: async candidate => {
+      let { playUrls, hevcUrls } = warmConfig.current;
+      let main = playUrls[candidate.key] || "", hevc = hevcUrls[candidate.key] || "";
+      if (!main || Date.now() - (playResolvedAt.current[candidate.key] || 0) >= PLAY_URL_TTL) {
+        const info = await api.play(candidate.id, candidate.ep, true);
+        main = info?.streams?.main || info?.video_url || "";
+        hevc = info?.streams?.hevc || info?.video_url_hevc || "";
+        if (main) {
+          playResolvedAt.current[candidate.key] = Date.now();
+          setPlayUrls(m => ({ ...m, [candidate.key]: main }));
+          setHevcUrls(m => ({ ...m, [candidate.key]: hevc }));
+        }
+      }
+      const config = warmConfig.current;
+      return config.preferHevc && config.hevcSupported && !config.hevcFailures[candidate.key] && hevc ? hevc : main;
+    },
+    prepare: url => api.mediaPrepare(url),
+    warm: url => api.mediaWarmup(url), status: url => api.mediaWarmupStatus(url), cancel: url => api.mediaWarmupCancel(url),
+    trace: tracePlayback, isForeground: hasForegroundPlayRequest,
+    acquireBufferingLease: request => videoRef.current?.acquireBufferingLease(request) ?? null,
+  }), []);
+  // 无 effect cleanup 依赖 timeupdate；调度器仅对候选/策略/失活更换代际。
   useEffect(() => {
-    if (!curId || kind !== "video") return;
-    const ep = epMap[curId] || 1;
-    const total = episodes.length;
-    const want: number[] = [];
-    if (ep > 1) want.push(ep - 1);
-    if (total === 0 || ep < total) want.push(ep + 1);
-    for (const e of want) {
-      const k = `${curId}:${e}`;
-      if (playUrls[k]) continue;
-      api.play(curId, e)
-        .then((info) => {
-          const u = info?.streams?.main || info?.video_url;
-          const h = info?.streams?.hevc || info?.video_url_hevc || "";
-          if (u) {
-            setPlayUrls((m) => ({ ...m, [k]: u }));
-            // 拿到地址后顺手预热首片：只预取地址的话，切集仍要等 3–5 秒下载首片，
-            // 观感上还是「切过去黑屏一下」。这里把分片也提前拉起来。
-            void api.mediaWarmup(u);
-          }
-          if (h) setHevcUrls((m) => ({ ...m, [k]: h }));
-        })
-        .catch(() => { /* 预热失败不影响当前播放 */ });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [curId, curEp, episodes.length]);
+    scheduler.update({ active: active && !!playUrl, currentUrl: playUrl, candidate: warmCandidate,
+      policy: `${preferHevc}:${hevcSupported}:${!!(warmCandidate && hevcFailures[warmCandidate.key])}`,
+      time, duration, buffered, rate: effRate, waiting,
+      seeking: seeking || gesture.current?.mode === "scrub" || barScrub.current, foreground: hasForegroundPlayRequest() });
+  });
+  useEffect(() => () => scheduler.stop(), [scheduler]);
+  const captureEpisodeIntent = (event: React.SyntheticEvent) => {
+    const button = (event.target as HTMLElement).closest("button");
+    const ep = Number(button?.textContent?.trim());
+    if (ep > 0 && episodes.some(e => e.ep_num === ep)) setEpisodeIntent(previous =>
+      previous?.id === curId && previous.ep === ep ? previous : { id: curId, ep });
+  };
 
   /* 切换条目/集数时重置播放状态 */
   useEffect(() => {
     setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
     setVsize({ w: 0, h: 0 });
+    setFirstFrameKey(""); setSeeking(false); setEpisodeIntent(null);
     setPortraitFit("contain");
   }, [playKey]);
 
@@ -472,6 +512,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       };
       if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
       gesture.current = null;
+      scrubTarget.current = null;
+      setScrub(null);
+      videoRef.current?.cancelPrefetch();
       if (holdRef.current) { holdRef.current = false; setHoldSpeed(false); }
       lockArmedRef.current = false;
       setLockArmed(false);
@@ -547,6 +590,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       const target = Math.max(0, Math.min(total, g.base + (dx / g.width) * total));
       scrubTarget.current = target;
       setScrub({ pct: (target / total) * 100, target });
+      videoRef.current?.prefetchAt(target);
     }
   };
 
@@ -582,6 +626,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     if (g.mode === "scrub") {
       const target = scrubTarget.current;
       if (!cancelled && target != null) videoRef.current?.seek(target, "mobile_gesture");
+      else videoRef.current?.cancelPrefetch();
       setScrub(null);
       scrubTarget.current = null;
       if (g.playing && active) videoRef.current?.play();
@@ -594,6 +639,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       const dx2 = e.clientX - g.x;
       if (Math.abs(dy) > 56 && Math.abs(dy) > Math.abs(dx2)) {
         const dir = dy < 0 ? 1 : -1;
+        setDirection(dir); setEpisodeIntent(null);
         const ep = epMap[curId] || 1;
         const total = episodes.length;
         const want = dir === 1 ? (total === 0 || ep < total ? ep + 1 : 0) : (ep > 1 ? ep - 1 : 0);
@@ -623,17 +669,28 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   };
 
   useEffect(() => {
-    if (!active || controlsLocked) onUp(true);
+    if (!active || controlsLocked) {
+      onUp(true);
+      barScrub.current = false;
+      setBarPct(null);
+      videoRef.current?.cancelPrefetch();
+    }
     // Cancel pending gestures when the page is hidden or controls are locked.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, controlsLocked]);
 
-  useEffect(() => () => {
-    if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
-    gesture.current = null;
-    holdRef.current = false;
-    lockArmedRef.current = false;
-  }, [playKey]);
+  useEffect(() => {
+    setScrub(null); setBarPct(null); setHoldSpeed(false); setLockArmed(false);
+    return () => {
+      if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
+      gesture.current = null;
+      scrubTarget.current = null;
+      barScrub.current = false;
+      holdRef.current = false;
+      lockArmedRef.current = false;
+      videoRef.current?.cancelPrefetch();
+    };
+  }, [playKey, playUrl]);
 
   /* 进出全屏：iOS 会在这时把播放打断，过渡期多补几次 play() */
   const keepAlive = useCallback(() => {
@@ -761,9 +818,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     const pct = barPctAt(clientX, clientY);
     if (pct == null) return null;
     setBarPct(pct);
+    if (duration) videoRef.current?.prefetchAt(pct * duration);
     return pct;
   };
   const onBarDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!active || controlsLocked || !duration || e.button !== 0) return;
     e.stopPropagation();
     videoRef.current?.trace("seek.input.down", { input: "mobile_bar" });
     barScrub.current = true;
@@ -781,13 +840,21 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     barScrub.current = false;
     e.stopPropagation();
     const pct = barPctAt(e.clientX, e.clientY);
-    if (pct != null && duration) {
+    if (pct != null && duration && active && !controlsLocked) {
       const target = pct * duration;
       videoRef.current?.trace("seek.input.up", { input: "mobile_bar", target });
       videoRef.current?.seek(target, "mobile_bar");
       setTime(target);
     }
     setBarPct(null);
+  };
+
+  const onBarCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!barScrub.current) return;
+    e.stopPropagation();
+    barScrub.current = false;
+    setBarPct(null);
+    videoRef.current?.cancelPrefetch();
   };
 
   const togglePip = async () => {
@@ -825,6 +892,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   };
 
   const pickEp = (ep: number) => {
+    setDirection(ep >= curEp ? 1 : -1);
+    setEpisodeIntent(null);
     setEpMap((m) => ({ ...m, [curId]: ep }));
     setPanel(null);
   };
@@ -839,7 +908,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   }
 
   return (
-    <div
+    <div data-video-id={curId} data-episode={curEp} data-warm-id={warmCandidate?.id} data-warm-episode={warmCandidate?.ep}
       className={`hg-player-ui ${rotated ? "fs-landscape" : (!isDesktop && fs ? "fs-immersive" : "absolute inset-0")} overflow-hidden bg-black player-root ${controlsLocked ? "is-locked" : ""} ${isDesktop ? "player-surface" : ""} ${theater ? "is-theater" : ""} ${isDesktop && idle ? "is-idle" : ""}`}
       onPointerMove={() => { if (isDesktop || fs) wake(); }}
       onPointerDown={() => { if (!isDesktop && fs) wake(); }}>
@@ -857,27 +926,31 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           return (
             <section key={vid} className={`${fs && !isActive ? "hidden" : "relative w-full h-full"} snap-start snap-always overflow-hidden`}>
               {isActive && playUrl ? (
-                <div className="absolute inset-0" style={{ touchAction: swipeEp ? "none" : "pan-y" }}
+                <div data-testid="mobile-video-gesture" className="absolute inset-0" style={{ touchAction: swipeEp ? "none" : "pan-y" }}
                   onPointerDown={onDown} onPointerMove={onMove} onPointerUp={(e) => onUp(false, e)} onPointerCancel={(e) => onUp(true, e)} onLostPointerCapture={(e) => onUp(true, e)}>
                 <div style={{ position: "absolute", inset: 0, transform: `translate3d(${zoom.x}px, ${zoom.y}px, 0) scale(${zoom.s})`, transformOrigin: "center center", transition: zoom.g ? "none" : "transform .18s ease-out" }}>
-                <VideoSurface ref={videoRef} src={playUrl} poster={posterUrl} autoPlay active={active} muted={muted}
+                <VideoSurface ref={videoRef} src={playUrl} sourceIdentity={playKey} poster={posterUrl} autoPlay active={active} muted={muted}
                   diagnosticContext={{ active, view: mode, kind, video_id: curId, episode: curEp }}
                   volume={volume} rate={effRate}
                   fit={isDesktop ? "contain" : landscapeVideo ? (fs || vpLandscape ? "contain" : portraitFit) : (vpLandscape ? "contain" : "cover")}
                   onClick={() => { if (isDesktop) videoRef.current?.toggle(); }}
                   onTime={onTimeTick}
+                  onBuffer={(end) => setBuffered(prev => prev === end ? prev : end)}
                   onDuration={onDurationTick}
                   onSize={(w, h) => setVsize((prev) => (prev.w === w && prev.h === h ? prev : { w, h }))}
+                  onQuality={next => setQuality(previous => previous.width === next.width && previous.height === next.height && previous.codec === next.codec ? previous : next)}
+                  onFirstFrame={() => setFirstFrameKey(playKey)}
+                  onSeeking={setSeeking}
                   onPlaying={() => { setPaused(false); setWaiting(false); }}
                   onPause={() => setPaused(true)}
                   onWaiting={() => setWaiting(true)}
                   onEnded={() => { const next = episodes.find((e) => e.ep_num === curEp + 1); if (next) pickEp(next.ep_num); }}
                   onError={(m) => {
-                    setErr(m);
-                    if (preferHevc && hevcUrl) {
-                      setPreferHevc(false);
-                      toast("高清播不了，已切回标准", "info");
-                    }
+                    if (effectiveHevc && mainUrl && isCodecFailure(m)) {
+                      setHevcFailures(prev => ({ ...prev, [playKey]: true }));
+                      setErr(""); setWaiting(true);
+                      toast("本集 HEVC 解码失败，已切回标准流并保留编码偏好", "info");
+                    } else { setErr(m); setWaiting(false); }
                   }} />
                 </div>
                 </div>
@@ -986,11 +1059,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       <span className="text-[10.5px] hg-ov-shadow" style={{ color: swipeEp ? "#f3c969" : undefined }}>切集</span>
                     </button>
                   )}
-                  {hevcUrl && (
-                    <button type="button" onClick={() => { setPreferHevc(!preferHevc); toast(preferHevc ? "已切回标准画质" : "已切换高清 HEVC", "ok"); }}
-                      className="flex flex-col items-center gap-1 pressable" aria-pressed={preferHevc} aria-label="画质切换">
-                      <span className={`flex items-center justify-center h-[22px] min-w-[30px] px-1 rounded-md text-[10.5px] font-bold hg-ov-shadow ${preferHevc ? "bg-primary text-on-primary" : "hg-chip hg-ink-2"}`}>{preferHevc ? "HD" : "标清"}</span>
-                      <span className="text-[10.5px] hg-ov-shadow" style={{ color: preferHevc ? "#fff" : undefined }}>{preferHevc ? "高清" : "标清"}</span>
+                  {playUrl && (
+                    <button type="button" onClick={toggleQuality}
+                      className="flex flex-col items-center gap-1 pressable" aria-pressed={effectiveHevc} aria-label="画质切换">
+                      <span className={`flex items-center justify-center h-[22px] min-w-[30px] px-1 rounded-md text-[10.5px] font-bold hg-ov-shadow ${effectiveHevc ? "bg-primary text-on-primary" : "hg-chip hg-ink-2"}`}>{qualityLabel(quality)}</span>
+                      <span className="text-[10.5px] hg-ov-shadow" style={{ color: effectiveHevc ? "#fff" : undefined }}>{codecLabel(quality.codec) || "自动编码"}</span>
                     </button>
                   )}
                   <button onClick={onFav} className="flex flex-col items-center gap-1 pressable" aria-pressed={isFav(curId)} aria-label="收藏">
@@ -1069,11 +1142,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       第 {curEp}/{episodes.length} 集
                     </span>
                   )}
-                   {hevcUrl && (
-                     <button type="button" aria-pressed={preferHevc}
-                       onClick={() => { setPreferHevc(!preferHevc); toast(preferHevc ? "已切回标准画质" : "已切换高清 HEVC", "ok"); }}
-                       className={`shrink-0 h-[18px] px-1.5 rounded-md text-[10px] font-bold flex items-center pressable transition-colors ${preferHevc ? "bg-primary text-on-primary" : "text-white border border-white/30"}`}>
-                       {preferHevc ? "HD" : "标清"}
+                   {playUrl && (
+                     <button type="button" aria-label="画质切换" title={`${qualityLabel(quality)} · ${codecLabel(quality.codec) || "自动编码"}`} aria-pressed={effectiveHevc}
+                       onClick={toggleQuality}
+                       className={`shrink-0 h-[18px] px-1.5 rounded-md text-[10px] font-bold flex items-center pressable transition-colors ${effectiveHevc ? "bg-primary text-on-primary" : "text-white border border-white/30"}`}>
+                       {qualityLabel(quality)}{codecLabel(quality.codec) ? ` · ${codecLabel(quality.codec)}` : ""}
                      </button>
                    )}
                    {!!meta.score && (
@@ -1106,8 +1179,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       className="px-4 flex items-center gap-0.5 text-[10.5px] font-medium hg-ink-3 hg-ov-shadow-strong pressable">
                       详情 · 第 {curEp} 集<IChevR size={11} />
                     </button>
-                    <div ref={barRef} className="mx-4 mt-2 relative" style={{ height: 14, touchAction: "none" }}
-                      onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarUp}>
+                    <div data-testid="mobile-seekbar" ref={barRef} className="mx-4 mt-2 relative" style={{ height: 14, touchAction: "none" }}
+                      onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarCancel} onLostPointerCapture={onBarCancel}>
                       {/* 轨道：几乎看不见，只暗示可拖动 */}
                       <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 h-[2px] rounded-full" style={{ background: "rgba(255,255,255,.1)" }}>
                         <div className="h-full rounded-full"
@@ -1160,7 +1233,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   <div className="rounded-xl p-5 flex flex-col items-center gap-3 text-[13px] hg-ink-2" style={{ background: "rgba(0,0,0,.7)" }}>
                     <span>视频暂时无法加载</span>
                     <span className="text-[10.5px] hg-ink-4 max-w-[240px] text-center break-all">{err}</span>
-                    <button className="hg-link text-[12.5px]" onClick={() => { setErr(""); setWaiting(true); videoRef.current?.play(); }}>重试</button>
+                    <button className="hg-link text-[12.5px]" onClick={() => { setErr(""); setWaiting(true); if (playUrl) videoRef.current?.retry(); else setPlayRequestEpoch(epoch => epoch + 1); }}>重试</button>
                   </div>
                 </div>
               )}
@@ -1172,7 +1245,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       {/* 桌面控制条 */}
       {isDesktop && (
         <PlayerControls
-          paused={paused} time={time} duration={duration} buffered={buffered} rate={rate}
+          paused={paused} time={time} duration={duration} buffered={duration > 0 ? buffered / duration : 0} rate={rate}
           muted={muted} volume={volume} theater={theater} fullscreen={fullscreen}
           visible={active && !idle}
           seekEnabled={active && !controlsLocked}
@@ -1183,7 +1256,13 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
           onToggleSwipe={() => { setSwipeEp(!swipeEp); toast(swipeEp ? "上下划切集已关闭" : "上下划切集已开启"); }}
           onToggle={() => videoRef.current?.toggle()}
           onSeek={(t, source) => { videoRef.current?.seek(t, source); setTime(t); }}
-          onSeekInteraction={(phase, input, target, pointerTarget) => videoRef.current?.trace(`seek.input.${phase}`, { input, target, pointer_target: pointerTarget })}
+          onSeekInteraction={(phase, input, target, pointerTarget) => {
+            videoRef.current?.trace(`seek.input.${phase}`, { input, target, pointer_target: pointerTarget });
+            // 拖动/点击预览阶段就推测预取目标分片：未缓存分片实测 4 秒+，
+            // 预览的几百毫秒足够 Rust 侧跑完大半下载，松手后经分片锁直接复用
+            if (phase === "change") videoRef.current?.prefetchAt(target);
+            if (phase === "cancel") videoRef.current?.cancelPrefetch();
+          }}
           onRate={(r) => { setRate(r); videoRef.current?.rate(r); }}
           onMute={() => setMuted((m) => !m)}
           onVolume={(v) => setVolume(v)}
@@ -1231,8 +1310,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
             paddingRight: rotated ? "calc(var(--sab, 0px) + 16px)" : undefined,
             height: 22,
           }}>
-          <div ref={barRef} className="relative h-full" style={{ touchAction: "none" }}
-            onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarUp}>
+          <div data-testid="mobile-seekbar" ref={barRef} className="relative h-full" style={{ touchAction: "none" }}
+            onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarCancel} onLostPointerCapture={onBarCancel}>
             <div className="absolute inset-x-0 bottom-[8px] h-[2.5px] rounded-full" style={{ background: "rgba(255,255,255,.3)" }}>
               <div className="h-full rounded-full bg-white" style={{ width: `${barProgress * 100}%` }} />
             </div>
@@ -1289,7 +1368,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         <div className={`desktop-dock-panel ${panel ? "is-open" : ""}`}>
           <div className="desktop-dock-inner">
             {panel === "episodes" ? (
-              <EpisodesPanel videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)} />
+              <div className="h-full" onPointerOver={captureEpisodeIntent} onPointerDownCapture={captureEpisodeIntent} onFocusCapture={captureEpisodeIntent}><EpisodesPanel videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)} /></div>
             ) : panel === "comments" ? (
               <CommentsPanel videoId={curId} ep={curEp} total={meta.comment} kind={kind} onClose={() => setPanel(null)} />
             ) : null}
@@ -1330,7 +1409,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
               <div className="flex-1 min-h-0">
                 {panel === "episodes" ? (
-                  <EpisodesPanel bare videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)} />
+                  <div className="h-full" onPointerOver={captureEpisodeIntent} onPointerDownCapture={captureEpisodeIntent} onFocusCapture={captureEpisodeIntent}><EpisodesPanel bare videoId={curId} episodes={episodes} current={curEp} onPick={pickEp} onClose={() => setPanel(null)} /></div>
                 ) : (
                   <div className="h-full scroll-y px-4 pb-5">
                     {/* 封面 / 标题 / 评分 / 数据 */}

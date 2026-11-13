@@ -1,2 +1,19 @@
 <!doctype html><meta charset="utf-8"><div id="root"></div><pre id="results">等待本地 HLS 播放及控制条隐藏…</pre>
+<!-- isTauri 在 api.ts 模块求值时就定型，必须先于测试模块注入 IPC 替身：
+     这样 LOCAL=hg.localhost（XHR 替身可改写到本地媒体服务器），rawCall 走 invoke 而非 fetch -->
+<script>
+  window.__TAURI_INTERNALS__ = {
+    transformCallback(callback) { return callback; },
+    invoke(cmd, args) {
+      if (cmd === "debug_log") return Promise.resolve();
+      if (cmd === "media_prepare" || cmd === "media_warmup" || cmd === "media_prefetch") return Promise.resolve(true);
+      if (cmd === "media_warmup_cancel") return Promise.resolve();
+      if (cmd === "media_warmup_status") return Promise.resolve({ state: "idle", playlist_ready: false, segment_ready: false, dependencies_ready: false, generation: 0 });
+      if (cmd === "api_related") return Promise.resolve({ items: [] });
+      if (cmd === "app_boot") return Promise.resolve({ user: null, logged_in: false, base: "https://fixture.invalid", strict_security: true });
+      if (cmd === "line_state") return Promise.resolve({ base: "https://fixture.invalid", default: "https://fixture.invalid", fixed: [] });
+      return Promise.resolve(null);
+    },
+  };
+</script>
 <script type="module" src="/tests/player-seek.tsx"></script>
