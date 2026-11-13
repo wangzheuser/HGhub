@@ -1124,9 +1124,10 @@ const RANGED_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[path = "net_download_metrics.rs"]
 mod download_metrics;
-use download_metrics::{DownloadTrace, StageTimer, TailPolicy};
+use download_metrics::{DownloadSummaryGuard, DownloadTrace, StageTimer, TailPolicy};
 
 type MediaBytes = (Option<String>, Vec<u8>);
+type RangeTasks = tokio::task::JoinSet<Result<(u64, Vec<u8>, Duration), RangeFailure>>;
 
 struct RangeFailure {
     message: String,
@@ -1278,6 +1279,7 @@ async fn ranged_attempt<F, Fut>(
     parts: usize,
     trace: Arc<DownloadTrace>,
     tail_policy: TailPolicy,
+    tasks: &mut RangeTasks,
 ) -> Result<MediaBytes, RangeFailure>
 where
     F: Fn(Option<(u64, u64)>) -> Fut + Clone + Send + Sync + 'static,
@@ -1352,8 +1354,8 @@ where
     let mut next = end + 1;
     // 头校验成功即可重叠读取首块与其余区间，不再串行等首块体读完。
     // 首块也占一个槽，总在途响应（含首块）仍受 concurrency 限制。
-    // JoinSet Drop 终止全部子任务；任何片失败都不提交半成品。
-    let mut tasks = tokio::task::JoinSet::new();
+    // JoinSet 由相位 timeout 外层持有；超时后先显式取消并回收，再进入整包回退。
+    // 父 future 取消时仍由 JoinSet Drop 终止子任务；任何片失败都不提交半成品。
     let mut pending: HashMap<u64, (u64, Instant)> = HashMap::new();
     let mut completed = Vec::with_capacity(concurrency);
     // 超大对象受 MAX_RANGE_BYTES 分批时保留原路径，不在超出 parts 的请求组投机救援。
@@ -1443,12 +1445,8 @@ where
                 let start = start as usize;
                 buffer[start..start + bytes.len()].copy_from_slice(&bytes);
             }
-            Err(error) => {
-                tasks.abort_all();
-                // 回退前先回收取消任务，避免旧分段与新整包下载重叠。
-                while tasks.join_next().await.is_some() {}
-                return Err(error);
-            }
+            // 保留原始终止/可恢复分类，由 timeout 外层统一取消并回收兄弟任务。
+            Err(error) => return Err(error),
         }
     }
     Ok((ctype, buffer))
@@ -1510,16 +1508,27 @@ where
         .await
         .map_err(|_| "整包下载超时".to_string())?;
     }
-    let failure = match tokio::time::timeout(
+    let mut tasks = RangeTasks::new();
+    let attempt = tokio::time::timeout(
         tail_policy.phase_budget,
-        ranged_attempt(request.clone(), parts, trace.clone(), tail_policy),
+        ranged_attempt(
+            request.clone(),
+            parts,
+            trace.clone(),
+            tail_policy,
+            &mut tasks,
+        ),
     )
-    .await
-    {
+    .await;
+    let failure = match attempt {
         Ok(Ok(value)) => return Ok(value),
         Ok(Err(failure)) => failure,
         Err(_) => RangeFailure::recoverable("分段下载超时"),
     };
+    tasks.abort_all();
+    // child 错误和普通 timeout 共用清理屏障；旧 request/response future 全部 Drop 后才回退。
+    // 保留错误分类，终止类403/429也先回收兄弟任务，但不转成可恢复timeout。
+    while tasks.join_next().await.is_some() {}
     if !failure.fallback || trace.tail_rescue.load(Ordering::Relaxed) != 0 {
         // 单尾救援与整包回退共用一次恢复预算；救援错误/超时不再重新下载全片。
         return Err(failure.message);
@@ -1552,6 +1561,11 @@ pub async fn fetch_bytes_ranged(
     let configured = std::env::var("HGHUB_MEDIA_DOWNLOAD_PARTS").ok();
     let selected_parts = download_metrics::parse_parts(configured.as_deref(), parts);
     let trace = Arc::new(DownloadTrace::new());
+    let mut summary = DownloadSummaryGuard::new(
+        crate::playback_log::resource_id(url),
+        selected_parts,
+        trace.clone(),
+    );
     let public_dns =
         Arc::new(AtomicBool::new(MEDIA_DNS_ROUTES.lock().ok().is_some_and(
             |routes| routes.prefers_public(host_of(url), Instant::now()),
@@ -1592,27 +1606,7 @@ pub async fn fetch_bytes_ranged(
         trace.clone(),
     )
     .await;
-    crate::playback_log::record(
-        "network.download",
-        json!({
-            "resource": crate::playback_log::resource_id(url),
-            "requested_parts": selected_parts,
-            "concurrency": trace.concurrency.load(Ordering::Relaxed),
-            "request_count": trace.requests.load(Ordering::Relaxed),
-            "probe_headers_ms": trace.probe_headers_ms.load(Ordering::Relaxed),
-            "probe_read_ms": trace.probe_read_ms.load(Ordering::Relaxed),
-            "slowest_range_ms": trace.slowest_range_ms.load(Ordering::Relaxed),
-            "fallback_count": trace.fallback.load(Ordering::Relaxed),
-            "recovery_kind": trace.recovery_kind(),
-            "tail_rescue": trace.tail_rescue.load(Ordering::Relaxed) != 0,
-            "tail_threshold_ms": trace.tail_threshold_ms.load(Ordering::Relaxed),
-            "tail_wait_ms": trace.tail_wait_ms.load(Ordering::Relaxed),
-            "tail_read_ms": trace.tail_read_ms.load(Ordering::Relaxed),
-            "elapsed_ms": trace.started.elapsed().as_millis() as u64,
-            "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()),
-            "error_kind": result.as_ref().err().map(|error| crate::playback_log::error_kind(error)),
-        }),
-    );
+    summary.finish(&result);
     if public_dns.load(Ordering::Relaxed) {
         if let Ok(mut routes) = MEDIA_DNS_ROUTES.lock() {
             if result.is_ok() {

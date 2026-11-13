@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Feed from "../components/Feed";
 import { api } from "../api";
 import type { VideoCard } from "../types";
@@ -52,7 +52,7 @@ export default function Home({ active, bottomInset }: { active: boolean; bottomI
 
   useEffect(() => { if (!items.length) load(1); /* eslint-disable-next-line */ }, []);
 
-  const ids = items.map((v) => v.id);
+  const ids = useMemo(() => items.map(v => v.id), [items]);
 
   return (
     <div className="absolute inset-0 bg-black">

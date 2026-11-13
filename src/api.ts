@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { tracePlayback } from "./playbackDiagnostics";
 import { createMediaSessionQueue } from "./mediaSessionQueue";
+import { createPrefetchTransport } from "./prefetchTransport";
 import { canonicalWarmupTarget } from "./mediaWarmupIdentity";
 import type {
   CommentPage, Detail, HotWord, Paged, PlayInfo, Post, PostCategory, RankItem, TagGroup, TopicCard, TopicDetail, User, UserProfile, VideoCard,
@@ -171,6 +172,11 @@ const playRequests = new Map<string, { promise: Promise<PlayInfo>; expires: numb
 export const PLAY_URL_TTL = 60_000;
 let foregroundPlayRequests = 0;
 export const hasForegroundPlayRequest = () => foregroundPlayRequests > 0;
+const prefetchTransport = createPrefetchTransport(
+  url => rawCall<boolean>("media_prefetch", { url }).catch(() => false),
+  url => rawCall<void>("media_prefetch_cancel", { url }).catch(() => {}),
+  canonicalWarmupTarget,
+);
 const enqueueMediaSession = createMediaSessionQueue((url, active) => rawCall<void>("media_session", { url, active }));
 let desiredMediaRoot = "";
 function sendMediaSession(url: string, active: boolean): Promise<void> {
@@ -206,6 +212,12 @@ function requestDetail(id: number): Promise<Detail> {
     if (value.expires !== Infinity) detailRequests.delete(key);
   }
   return entry.promise;
+}
+
+/** 读取既有播放地址缓存的真实到期时刻，不触发请求或延长TTL。 */
+export function playUrlExpiry(id: number, ep: number): number | undefined {
+  const expires = playRequests.get(`${id}:${ep}`)?.expires;
+  return expires !== undefined && Number.isFinite(expires) ? expires : undefined;
 }
 
 export type MediaWarmupStatus = {
@@ -311,9 +323,9 @@ export const api = {
   mediaWarmupStatus: (url: string) => rawCall<MediaWarmupStatus>("media_warmup_status", { url }),
   mediaWarmupCancel: cancelWarmup,
   /** 拖动/点击进度条时的推测预取：把预览位置的分片提前下载进缓存；失败静默，仅加速 */
-  mediaPrefetch: (url: string) => rawCall<boolean>("media_prefetch", { url }).catch(() => false),
+  mediaPrefetch: (url: string) => prefetchTransport.prefetch(url),
   /** 仅取消匹配 URL 的旧推测任务，避免旧组件 cleanup 误伤新目标。 */
-  mediaPrefetchCancel: (url?: string) => rawCall<void>("media_prefetch_cancel", url ? { url } : {}).catch(() => {}),
+  mediaPrefetchCancel: (url?: string) => url ? prefetchTransport.cancel(url) : rawCall<void>("media_prefetch_cancel", {}).catch(() => {}),
   /** url 始终是原始播放列表地址；后台按会话隔离预热/预取。 */
   mediaSession: sendMediaSession,
   netDiag: () => rawCall<Record<string, unknown>>("net_diag"),

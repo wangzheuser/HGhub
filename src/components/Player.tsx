@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
+import { mediaElementSource, matchesMediaElementSource } from "../mediaElementSource";
+import { createMediaSessionConfirmation, waitForLatestMediaSession } from "../mediaSessionConfirmation";
 import { api, fmtTime, platform, playlist } from "../api";
 import { mediaErrorMessage } from "../mediaErrors";
 import { mediaHost, mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
@@ -34,24 +36,39 @@ export default function Player({
   const wrapRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const [retryEpoch, setRetryEpoch] = useState(0);
+  const sourceRequest = useMemo(() => ({ src, retryEpoch }), [src, retryEpoch]);
+  const latestRequest = useRef(sourceRequest); latestRequest.current = sourceRequest;
+  const boundSource = useRef<{ request: typeof sourceRequest; resource: string; ready: boolean } | null>(null);
+  const currentSource = (ready = true) => {
+    const bound = boundSource.current, video = videoRef.current;
+    return !!bound && bound.request === latestRequest.current && !!video && matchesMediaElementSource(video, bound.resource) && (!ready || (bound.ready && video.readyState >= 1));
+  };
   const terminalRef = useRef(false);
   const retryPosition = useRef<{ src: string; time: number; rate: number; wanted: boolean } | null>(null);
   const recoveryControl = useRef<ReturnType<typeof installHlsRecovery> | null>(null);
-  const seekPrefetch = useMemo(() => createSeekPrefetch(() => hlsRef.current), []);
+  const seekPrefetch = useMemo(() => createSeekPrefetch(() => hlsRef.current, {
+    prefetch: url => api.mediaPrefetch(url), cancel: url => api.mediaPrefetchCancel(url),
+    isBuffered: time => !!videoRef.current && isTimeBuffered(videoRef.current, time),
+  }), []);
   useEffect(() => { if (active) recoveryControl.current?.sync(); else recoveryControl.current?.suspend(); }, [active]);
   const { trace, requestSeek } = usePlayerDiagnostics(videoRef, hlsRef, { view: "post_detail", ...diagnosticContext, active, resource: mediaResource(src) });
-  const [session, setSession] = useState({ src: "", active: false });
+  const sessionRequest = useMemo(() => ({ ...createMediaSessionConfirmation(), src, active, retryEpoch }), [src, active, retryEpoch]);
+  const latestSessionRequest = useRef(sessionRequest); latestSessionRequest.current = sessionRequest;
+  const [session, setSession] = useState<typeof sessionRequest | null>(null);
   const sessionReady = useRef<Promise<void>>(Promise.resolve());
-  const activity = usePlaybackActivity(videoRef, hlsRef, { active: active && session.src === src && session.active, autoPlay: !!autoPlay, src, trace });
+  const activity = usePlaybackActivity(videoRef, hlsRef, { active: active && session === sessionRequest, autoPlay: !!autoPlay, src, trace });
   useEffect(() => {
     if (!src) return;
     let alive = true;
     const url = originalMediaUrl(src);
-    sessionReady.current = api.mediaSession(url, active).then(() => { if (alive) setSession({ src, active }); });
+    sessionReady.current = api.mediaSession(url, active).then(() => {
+      sessionRequest.acknowledge();
+      if (alive && latestSessionRequest.current === sessionRequest) setSession(sessionRequest);
+    }, error => { sessionRequest.fail(error); throw error; });
     void sessionReady.current.catch(() => { if (alive) setErrMsg("播放会话确认失败，请重试"); });
     if (!active) seekPrefetch.cancel();
     return () => { alive = false; seekPrefetch.cancel(); void api.mediaSession(url, false).catch(() => {}); };
-  }, [src, active, seekPrefetch, retryEpoch]);
+  }, [sessionRequest, seekPrefetch]);
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [time, setTime] = useState(0);
@@ -69,7 +86,7 @@ export default function Player({
     },
     onSeek: (target, input) => {
       const video = videoRef.current;
-      if (!video || !activity.isActive()) return;
+      if (!video || !currentSource() || !activity.isActive()) return;
       requestSeek(target, `legacy_${input}`);
       seekPrefetch.commit(target);
       const buffered = isTimeBuffered(video, target);
@@ -87,6 +104,7 @@ export default function Player({
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !src) return;
+    boundSource.current = null;
     setErrMsg("");
     setWaiting(false);
     let disposed = false;
@@ -95,7 +113,7 @@ export default function Player({
     if (saved) activity.restoreWanted(saved.wanted);
     video.playbackRate = saved?.rate ?? rate;
     const restorePosition = () => {
-      if (!saved) return;
+      if (!saved || !currentSource(false) || video.readyState < 1) return;
       video.playbackRate = saved.rate;
       if (saved.time > 0) video.currentTime = Number.isFinite(video.duration) ? Math.min(saved.time, Math.max(0, video.duration - .15)) : saved.time;
       trace("source.restored", { target: saved.time, rate: saved.rate, play_wanted: saved.wanted });
@@ -154,10 +172,11 @@ export default function Player({
       });
       hlsRef.current = hls;
       observeHls(hls, trace);
-      void sessionReady.current.then(() => {
-        if (disposed) return;
+      void waitForLatestMediaSession(() => latestSessionRequest.current, () => disposed).then(acknowledged => {
+        if (!acknowledged || disposed || latestRequest.current !== sourceRequest) return;
         hls.loadSource(url);
         hls.attachMedia(video);
+        boundSource.current = { request: sourceRequest, resource: mediaElementSource(video), ready: false };
       }).catch(() => {});
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (activity.isActive()) hls.startLoad(saved?.time ?? -1);
@@ -175,9 +194,10 @@ export default function Player({
       recoveryControl.current = stopRecovery;
     } else {
       // Safari / 部分 WebView 原生支持 HLS
-      void sessionReady.current.then(() => {
-        if (disposed) return;
+      void waitForLatestMediaSession(() => latestSessionRequest.current, () => disposed).then(acknowledged => {
+        if (!acknowledged || disposed || latestRequest.current !== sourceRequest) return;
         video.src = url;
+        boundSource.current = { request: sourceRequest, resource: mediaElementSource(video), ready: false };
         if (autoPlay) activity.play("native_autoplay", true);
       }).catch(() => {});
     }
@@ -193,7 +213,7 @@ export default function Player({
       seekPrefetch.cancel();
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     };
-  }, [src, autoPlay, retryEpoch]);
+  }, [sourceRequest]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -252,19 +272,22 @@ export default function Player({
         loop={loop}
         className="w-full h-full object-contain bg-black"
         onClick={toggle}
-        onPlay={() => { if (activity.isActive()) { setPlaying(true); onTogglePlay?.(true); } }}
-        onPause={() => { setPlaying(false); onTogglePlay?.(false); }}
-        onWaiting={() => setWaiting(true)}
-        onPlaying={() => { if (activity.isActive()) { setPlaying(true); setWaiting(false); setErrMsg(""); onPlaying?.(); } }}
-        onSeeked={() => setWaiting(false)}
-        onTimeUpdate={(e) => setTime((e.target as HTMLVideoElement).currentTime)}
+        onPlay={() => { if (currentSource() && activity.isActive() && !videoRef.current?.paused) { activity.observePlay(); setPlaying(true); onTogglePlay?.(true); } }}
+        onPause={() => { if (currentSource()) { activity.observePause(); setPlaying(false); onTogglePlay?.(false); } }}
+        onWaiting={() => { if (currentSource(false)) setWaiting(true); }}
+        onPlaying={() => { if (currentSource() && activity.isActive()) { setPlaying(true); setWaiting(false); setErrMsg(""); onPlaying?.(); } }}
+        onSeeked={() => { if (currentSource()) setWaiting(false); }}
+        onTimeUpdate={(e) => { if (currentSource() && activity.isActive()) setTime(e.currentTarget.currentTime); }}
         onLoadedMetadata={(e) => {
-          setDuration((e.target as HTMLVideoElement).duration || 0);
+          const video = e.currentTarget;
+          if (!currentSource(false) || video !== videoRef.current || video.readyState < 1) return;
+          boundSource.current!.ready = true;
+          setDuration(video.duration || 0);
           if (!hlsRef.current && autoPlay) activity.play("native_metadata", true);
         }}
-        onEnded={() => { if (activity.isActive()) onEnded?.(); }}
+        onEnded={() => { if (currentSource() && activity.isActive()) onEnded?.(); }}
         onError={() => {
-          if (hlsRef.current || terminalRef.current) return;
+          if (!currentSource(false) || hlsRef.current || terminalRef.current) return;
           terminalRef.current = true;
           setWaiting(false);
           setPlaying(false);

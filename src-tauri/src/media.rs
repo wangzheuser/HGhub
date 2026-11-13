@@ -2144,6 +2144,10 @@ pub fn speculative_prefetch(url: &str) -> bool {
     if !mark_foreground(url) {
         return false;
     }
+    // 已有完整内存片不改变seek代际，也不撤销正在供当前播放复用的推测任务。
+    if memory_has(url) {
+        return true;
+    }
     let key = cache_key(url);
     let Ok(mut slot) = SPECULATIVE.lock() else {
         return false;
@@ -2554,6 +2558,58 @@ high/index.m3u8?auth_key=1-0-x\n";
         task.abort();
         let _ = task.await;
         assert_eq!(COUNT.load(Ordering::Relaxed), 0);
+    }
+
+    // 与既有全局缓存/会话测试一样，使用 --test-threads=1。
+    #[tokio::test]
+    async fn cached_speculative_target_does_not_advance_seek_epoch_or_cancel_current_slot() {
+        struct MarkDrop(Arc<AtomicBool>);
+        impl Drop for MarkDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = dropped.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _guard = MarkDrop(flag);
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        let slot_key = "https://cached-seek.fixture.invalid/inflight.ts".to_string();
+        let old_slot = SPECULATIVE
+            .lock()
+            .unwrap()
+            .replace((slot_key.clone(), handle));
+        let url = "https://cached-seek.fixture.invalid/cached.ts";
+        let key = cache_key(url);
+        let previous = SEG_CACHE.lock().unwrap().insert(
+            key.clone(),
+            LruEntry {
+                value: ("video/mp2t".into(), Arc::new(vec![7; 1024])),
+                used: next_seq(),
+            },
+        );
+        let epoch = *SEEK_EPOCH.borrow();
+        assert!(speculative_prefetch(url));
+        tokio::task::yield_now().await;
+        assert_eq!(*SEEK_EPOCH.borrow(), epoch);
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            SPECULATIVE.lock().unwrap().as_ref().map(|(key, _)| key),
+            Some(&slot_key)
+        );
+        let own_slot = std::mem::replace(&mut *SPECULATIVE.lock().unwrap(), old_slot).unwrap();
+        own_slot.1.abort();
+        let _ = own_slot.1.await;
+        let mut cache = SEG_CACHE.lock().unwrap();
+        if let Some(previous) = previous {
+            cache.insert(key, previous);
+        } else {
+            cache.remove(&key);
+        }
     }
 
     #[test]

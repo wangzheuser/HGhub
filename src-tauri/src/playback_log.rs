@@ -70,6 +70,21 @@ pub fn error_kind(error: &str) -> &'static str {
     }
 }
 
+// Fixed frontend diagnostic dictionary; unknown reasons are omitted, never hashed/coerced.
+// 1..=23: cache_evicted, session_changed, session_inactive, session_unavailable,
+// retryable, requested, foreground, background_busy, cache_not_retained, cache_cleared,
+// unsupported_audio_rendition, unsupported_byte_range, unsupported_encryption,
+// missing_key_uri, missing_init_uri, no_media_segment, playlist_depth, playlist_expired,
+// invalid_playlist, http_auth, http, timeout, network.
+// 101..=109: resolve_failed, prepare_failed, admission_budget, media_budget,
+// playlist_refresh_budget, playlist_refresh_failed, failure_budget, prepare_error, rpc_error.
+// 201..=215: exhausted, ready, unsupported, candidate, inactive, stop, low_buffer,
+// waiting, seek, seek_preview, external_pause, external_resume, released, not_paused,
+// acquire_failed. Codes are stable across warm.status/exhausted/lease.release events.
+fn allowed_cause_code(value: &Value) -> bool {
+    matches!(value.as_u64(), Some(1..=23 | 101..=109 | 201..=215))
+}
+
 // Defense in depth for frontend entries: no arbitrary URL/message/header fields reach disk.
 fn scrub(value: &Value, depth: usize) -> Value {
     if depth > 5 {
@@ -91,6 +106,10 @@ fn scrub(value: &Value, depth: usize) -> Value {
                 .take(64)
                 .filter_map(|(key, v)| {
                     let k = key.to_ascii_lowercase();
+                    if k == "cause_code" {
+                        return (depth < 5 && key == "cause_code" && allowed_cause_code(v))
+                            .then(|| (key.clone(), v.clone()));
+                    }
                     if [
                         "url",
                         "src",
@@ -337,7 +356,10 @@ mod tests {
 
     #[test]
     fn connection_timeout_and_policy_errors_keep_their_categories() {
-        assert_eq!(error_kind("client error (Connect) ← operation timed out"), "timeout");
+        assert_eq!(
+            error_kind("client error (Connect) ← operation timed out"),
+            "timeout"
+        );
         assert_eq!(error_kind("request timeout"), "timeout");
         assert_eq!(error_kind("DNS 解析超时"), "dns_error");
         assert_eq!(error_kind("禁止访问普通内网"), "private_address_denied");
@@ -377,7 +399,10 @@ mod tests {
         // 导出的就是 JSONL 本体：环境记录 + 每行事件，一行一个对象，不掺纯文本。
         assert!(text.contains("\"diagnostics.env\""));
         for line in text.lines() {
-            assert!(line.starts_with('{') && line.ends_with('}'), "不是 JSONL 行: {line}");
+            assert!(
+                line.starts_with('{') && line.ends_with('}'),
+                "不是 JSONL 行: {line}"
+            );
             serde_json::from_str::<Value>(line).expect("导出行必须可解析");
         }
         bind(&dir);
@@ -393,6 +418,59 @@ mod tests {
         assert!(!value.contains("secret"));
         assert!(value.contains("r123"));
         assert_eq!(resource_id("hello"), "r4f9f2cab");
+    }
+
+    #[test]
+    fn only_known_integer_cause_codes_survive_without_relaxing_reason_scrubbing() {
+        for code in (1u64..=23).chain(101..=109).chain(201..=215) {
+            let clean = scrub(
+                &json!({
+                    "cause_code": code,
+                    "reason": "secret",
+                    "reason_code": code,
+                    "nested": {"cause_code": code, "cancelReason": "secret"},
+                }),
+                0,
+            );
+            assert_eq!(clean["cause_code"], code);
+            assert_eq!(clean["nested"]["cause_code"], code);
+            assert!(clean.get("reason").is_none());
+            assert!(clean.get("reason_code").is_none());
+            assert!(clean["nested"].get("cancelReason").is_none());
+        }
+        for invalid in [
+            json!(0),
+            json!(24),
+            json!(100),
+            json!(110),
+            json!(200),
+            json!(216),
+            json!(u64::MAX),
+            json!(-1),
+            json!(22.0),
+            json!("22"),
+            json!(true),
+            json!(null),
+            json!([22]),
+            json!({"code": 22}),
+            json!("https://secret"),
+        ] {
+            let clean = scrub(&json!({"cause_code": invalid, "resource": "r123"}), 0);
+            assert!(clean.get("cause_code").is_none(), "{invalid}");
+            assert_eq!(clean["resource"], "r123");
+        }
+        let clean = scrub(
+            &json!({
+                "Cause_Code": "secret", "CAUSE_CODE": 22,
+                "cause_code_reason": 22, "url": "https://secret", "token": "secret",
+            }),
+            0,
+        );
+        assert_eq!(clean, json!({}));
+        assert!(scrub(&json!({"cause_code": 22}), 5)
+            .get("cause_code")
+            .is_none());
+        assert_eq!(scrub(&json!({"cause_code": 22}), 6), Value::Null);
     }
 
     #[test]

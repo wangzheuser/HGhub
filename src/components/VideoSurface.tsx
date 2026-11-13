@@ -1,5 +1,7 @@
 import { useEffect, useImperativeHandle, useMemo, useRef, forwardRef, useState } from "react";
 import Hls from "hls.js";
+import { mediaElementSource, matchesMediaElementSource } from "../mediaElementSource";
+import { createMediaSessionConfirmation, waitForLatestMediaSession } from "../mediaSessionConfirmation";
 import { api, isLocalMedia, platform, playlist } from "../api";
 import { mediaErrorMessage } from "../mediaErrors";
 import { mediaHost, mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
@@ -26,6 +28,11 @@ export function canPlayHevc(): boolean {
 export type VideoHandle = {
   el: () => HTMLVideoElement | null;
   play: () => void;
+  /** 保活只恢复仍有播放意图的当前源，不覆盖用户暂停。 */
+  resumeWanted: () => void;
+  playWanted: () => boolean;
+  sourceToken: () => object;
+  isActive: () => boolean;
   pause: () => void;
   toggle: () => void;
   seek: (t: number, source?: string) => void;
@@ -80,8 +87,17 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   const hlsRef = useRef<Hls | null>(null);
   const bufferingLease = useRef<BufferingLease | null>(null);
   const standardMse = useRef<Hls | null>(null);
-  const latestSource = useRef(src); latestSource.current = src;
   const [retryEpoch, setRetryEpoch] = useState(0);
+  const latestSource = useRef(src); latestSource.current = src;
+  const sourceRequest = useMemo(() => ({ src, identity: sourceIdentity, retryEpoch }), [src, sourceIdentity, retryEpoch]);
+  const latestRequest = useRef(sourceRequest); latestRequest.current = sourceRequest;
+  const loadedSource = useRef<{ request: typeof sourceRequest; resource: string; ready: boolean } | null>(null);
+  const isCurrentSource = (requireMetadata = true) => {
+    const loaded = loadedSource.current, video = videoRef.current;
+    return !!loaded && loaded.request === latestRequest.current && !!video
+      && matchesMediaElementSource(video, loaded.resource)
+      && (!requireMetadata || (loaded.ready && video.readyState >= 1));
+  };
   const terminalRef = useRef(false);
   const recoveryControl = useRef<ReturnType<typeof installHlsRecovery> | null>(null);
   const restoredRate = useRef<number | null>(null);
@@ -92,12 +108,16 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   const capabilityKey = useRef("");
   const nearEndFiredRef = useRef(false);
   const renderedFrame = useRef(false);
-  const seekPrefetch = useMemo(() => createSeekPrefetch(() => hlsRef.current), []);
+  const seekPrefetch = useMemo(() => createSeekPrefetch(() => hlsRef.current, {
+    prefetch: url => api.mediaPrefetch(url), cancel: url => api.mediaPrefetchCancel(url),
+    isBuffered: time => !!videoRef.current && isTimeBuffered(videoRef.current, time),
+  }), []);
   useEffect(() => { if (active) recoveryControl.current?.sync(); else recoveryControl.current?.suspend(); }, [active]);
   const [ready, setReady] = useState(false);
   const bufferCallback = useRef(onBuffer); bufferCallback.current = onBuffer;
   const lastBuffer = useRef(-1);
   const reportBuffer = () => {
+    if (!isCurrentSource()) return;
     const v = videoRef.current;
     const end = v ? Math.round(bufferedEnd(v) * 10) / 10 : 0;
     if (v && bufferingLease.current?.active()) {
@@ -107,21 +127,26 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     if (end !== lastBuffer.current) { lastBuffer.current = end; bufferCallback.current?.(end); }
   };
   const { trace, requestSeek } = usePlayerDiagnostics(videoRef, hlsRef, { ...diagnosticContext, active, resource: mediaResource(src) });
-  const [session, setSession] = useState({ src: "", active: false });
+  const sessionRequest = useMemo(() => ({ ...createMediaSessionConfirmation(), src, active, retryEpoch }), [src, active, retryEpoch]);
+  const latestSessionRequest = useRef(sessionRequest); latestSessionRequest.current = sessionRequest;
+  const [session, setSession] = useState<typeof sessionRequest | null>(null);
   const sessionReady = useRef<Promise<void>>(Promise.resolve());
-  const activity = usePlaybackActivity(videoRef, hlsRef, { active: active && session.src === src && session.active, autoPlay, src: sourceIdentity, trace });
+  const activity = usePlaybackActivity(videoRef, hlsRef, { active: active && session === sessionRequest, autoPlay, src: sourceIdentity, trace });
   useEffect(() => {
     if (!src) return;
     let alive = true;
     const url = originalMediaUrl(src);
-    sessionReady.current = api.mediaSession(url, active).then(() => { if (alive) setSession({ src, active }); });
+    sessionReady.current = api.mediaSession(url, active).then(() => {
+      sessionRequest.acknowledge();
+      if (alive && latestSessionRequest.current === sessionRequest) setSession(sessionRequest);
+    }, error => { sessionRequest.fail(error); throw error; });
     void sessionReady.current.catch(() => { if (alive) callbacks.current.onError?.("播放会话确认失败，请重试"); });
     if (!active) { seekPrefetch.cancel(); bufferingLease.current?.release("inactive", false); }
     return () => { alive = false; seekPrefetch.cancel(); void api.mediaSession(url, false).catch(() => {}); };
-  }, [src, active, seekPrefetch, retryEpoch]);
+  }, [sessionRequest, seekPrefetch]);
 
   const reportSize = (v: HTMLVideoElement | null) => {
-    if (!v) return;
+    if (!v || !isCurrentSource(false)) return;
     const w = v.videoWidth || 0;
     const h = v.videoHeight || 0;
     if (w > 0 && h > 0) callbacks.current.onSize?.(w, h);
@@ -140,6 +165,10 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   useImperativeHandle(ref, () => ({
     el: () => videoRef.current,
     play: () => { if (!terminalRef.current) activity.play("handle"); },
+    resumeWanted: () => { if (!terminalRef.current && isCurrentSource()) activity.play("keep_alive", true); },
+    playWanted: () => activity.playWanted(),
+    sourceToken: () => latestRequest.current,
+    isActive: () => activity.isActive() && isCurrentSource(),
     retry: () => { activity.restoreWanted(true); setRetryEpoch(epoch => epoch + 1); },
     acquireBufferingLease: request => {
       const hls = hlsRef.current, video = videoRef.current;
@@ -168,7 +197,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     },
     seek: (t: number, source = "handle") => {
       const v = videoRef.current;
-      if (!v || terminalRef.current || !Number.isFinite(t) || !activity.isActive()) return;
+      if (!v || terminalRef.current || !Number.isFinite(t) || !isCurrentSource() || !activity.isActive()) return;
       // iOS 上直接赋到 duration 会卡在 ended 态，夹到结尾前 0.15s
       const dur = v.duration && Number.isFinite(v.duration) ? v.duration : 0;
       const target = dur > 0 ? Math.max(0, Math.min(dur - 0.15, t)) : Math.max(0, t);
@@ -196,6 +225,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !src) return;
+    loadedSource.current = null; // 尚未ACK/attach，不把旧元素事件认作新源。
     setReady(false);
     lastBuffer.current = -1;
     bufferCallback.current?.(0);
@@ -215,7 +245,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     let rendered = false;
     const sourceStarted = performance.now();
     const frameReady = (method: string, mediaTime: number) => {
-      if (disposed || rendered || !activity.isActive()) return;
+      if (disposed || rendered || !isCurrentSource() || !activity.isActive()) return;
       rendered = true; renderedFrame.current = true;
       stopRecovery?.sync();
       trace("source.firstframe", { method, frame_time: mediaTime, elapsed_ms: Math.round(performance.now() - sourceStarted) });
@@ -230,7 +260,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     }
     const onRenderedFallback = () => { if (!video.requestVideoFrameCallback) frameReady("playing_fallback", video.currentTime); };
     const restorePosition = () => {
-      if (!saved) return;
+      if (!saved || !isCurrentSource(false) || video.readyState < 1) return;
       video.playbackRate = saved.rate;
       if (Number.isFinite(saved.time) && saved.time > 0) {
         video.currentTime = Number.isFinite(video.duration) ? Math.min(saved.time, Math.max(0, video.duration - .15)) : saved.time;
@@ -292,13 +322,15 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       hls.once(Hls.Events.DESTROYING, () => { if (hlsRef.current === hls) bufferingLease.current?.release("destroy", false); });
       hls.on(Hls.Events.MEDIA_ATTACHED, (_event, data) => {
         const source = data.mediaSource;
+        if (latestRequest.current === sourceRequest && loadedSource.current?.request === sourceRequest) loadedSource.current.resource = mediaElementSource(video);
         if (hlsRef.current === hls && source && source.constructor.name !== "ManagedMediaSource" && typeof window.MediaSource === "function" && source instanceof window.MediaSource) standardMse.current = hls;
       });
       observeHls(hls, trace);
-      void sessionReady.current.then(() => {
-        if (disposed) return;
+      void waitForLatestMediaSession(() => latestSessionRequest.current, () => disposed).then(acknowledged => {
+        if (!acknowledged || disposed || latestRequest.current !== sourceRequest) return;
         hls.loadSource(url);
         hls.attachMedia(video);
+        loadedSource.current = { request: sourceRequest, resource: mediaElementSource(video), ready: false };
       }).catch(() => {});
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         if (activity.isActive()) hls.startLoad(saved?.time ?? -1);
@@ -328,9 +360,10 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       });
       recoveryControl.current = stopRecovery;
     } else {
-      void sessionReady.current.then(() => {
-        if (disposed) return;
+      void waitForLatestMediaSession(() => latestSessionRequest.current, () => disposed).then(acknowledged => {
+        if (!acknowledged || disposed || latestRequest.current !== sourceRequest) return;
         video.src = url;
+        loadedSource.current = { request: sourceRequest, resource: mediaElementSource(video), ready: false };
         if (autoPlay) activity.play("native_autoplay", true);
       }).catch(() => {});
     }
@@ -353,7 +386,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src, retryEpoch]);
+  }, [sourceRequest]);
 
   // iOS 内联播放：部分 WKWebView 只认 HTML 属性
   useEffect(() => {
@@ -372,7 +405,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   };
 
   const handleVideoError = () => {
-    if (hlsRef.current || terminalRef.current) return;
+    if (!isCurrentSource(false) || hlsRef.current || terminalRef.current) return;
     terminalRef.current = true;
     callbacks.current.onError?.(mediaErrorMessage(videoRef.current?.error ?? null));
   };
@@ -389,6 +422,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       className={`w-full h-full bg-black ${fit === "cover" ? "object-cover" : "object-contain"} ${className}`}
       style={{ opacity: ready ? 1 : 0, transition: "opacity .35s" }}
       onLoadedData={(e) => {
+        if (!isCurrentSource()) return;
         const v = e.target as HTMLVideoElement;
         setReady(true);
         reapply(v);
@@ -396,10 +430,11 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
       }}
       onProgress={reportBuffer}
       onRateChange={reportBuffer}
-      onSeeking={() => { bufferingLease.current?.release("seek"); callbacks.current.onSeeking?.(true); }}
-      onSeeked={() => { reportBuffer(); callbacks.current.onSeeking?.(false); }}
+      onSeeking={() => { if (isCurrentSource()) { bufferingLease.current?.release("seek"); callbacks.current.onSeeking?.(true); } }}
+      onSeeked={() => { if (isCurrentSource()) { reportBuffer(); callbacks.current.onSeeking?.(false); } }}
       onEmptied={reportBuffer}
       onTimeUpdate={(e) => {
+        if (!isCurrentSource() || !activity.isActive()) return;
         const v = e.target as HTMLVideoElement;
         reportBuffer();
         reportSize(v);
@@ -412,19 +447,28 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         }
       }}
       onLoadedMetadata={(e) => {
-        const v = e.target as HTMLVideoElement;
+        const v = e.currentTarget;
+        if (!isCurrentSource(false) || v !== videoRef.current || v.readyState < 1) return;
+        loadedSource.current!.ready = true;
         reapply(v);
         onDuration?.(v.duration || 0);
         reportSize(v);
         if (!hlsRef.current && autoPlay) activity.play("native_metadata", true);
       }}
-      onPause={() => onPause?.()}
-      onWaiting={() => { bufferingLease.current?.release("waiting"); onWaiting?.(); }}
+      onPlay={() => { if (isCurrentSource() && !videoRef.current?.paused) activity.observePlay(); }}
+      onPause={() => {
+        if (!isCurrentSource()) return;
+        // 原生pause来源没有可靠标签：默认尊重暂停，不让保活猜测覆盖系统媒体键/PiP操作。
+        activity.observePause();
+        onPause?.();
+      }}
+      onWaiting={() => { if (isCurrentSource(false)) { bufferingLease.current?.release("waiting"); onWaiting?.(); } }}
       onPlaying={(e) => {
+        if (!isCurrentSource()) return;
         reportSize(e.target as HTMLVideoElement);
         if (activity.isActive()) onPlaying?.();
       }}
-      onEnded={() => { if (activity.isActive()) onEnded?.(); }}
+      onEnded={() => { if (isCurrentSource() && activity.isActive()) onEnded?.(); }}
       onError={handleVideoError}
     />
   );

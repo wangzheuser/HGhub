@@ -1,4 +1,6 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createWatchHistoryStore, type WatchProgress } from "./watchHistory";
+export type { WatchProgress } from "./watchHistory";
 import { api, platform as envPlatform } from "./api";
 import { isStrictSecurity, setStrictSecurity as setHtmlStrictSecurity } from "./html";
 import type { User } from "./types";
@@ -56,9 +58,6 @@ export type Toast = {
   /** 线路切换专用的结构化内容，有这个就不看 msg */
   line?: { region: "cn" | "intl"; host: string; ms: number };
 };
-
-/** 观看记录：看到第几集、第几秒（`dur` 用来判断是否已看完） */
-export type WatchProgress = { id: number; ep: number; t: number; dur: number; at: number };
 
 type Persist = {
   likes: number[];
@@ -143,11 +142,11 @@ type Store = {
   user: User | null; setUser: (u: User | null) => void;
   loginOpen: boolean; setLoginOpen: (b: boolean) => void;
   logout: () => Promise<void>;
-  likes: number[]; favs: number[]; history: WatchProgress[]; follows: number[];
+  likes: number[]; favs: number[]; follows: number[];
   isLiked: (id: number) => boolean; isFav: (id: number) => boolean;
   toggleLikeLocal: (id: number) => boolean;
   toggleFavLocal: (id: number) => boolean;
-  /** 记一条观看记录；`ep/t/dur` 省略时保留原进度，`ep` 变了就把进度归零 */
+  /** 历史独立订阅；跨集仅在未显式传时间/时长时归零。 */
   addHistory: (id: number, ep?: number, t?: number, dur?: number) => void;
   clearHistory: () => void;
   toggleFollowLocal: (uid: number) => boolean;
@@ -169,10 +168,25 @@ type Store = {
 
 const Ctx = createContext<Store>(null as unknown as Store);
 export const useStore = () => useContext(Ctx);
+const HistoryCtx = createContext<ReturnType<typeof createWatchHistoryStore>>(null as unknown as ReturnType<typeof createWatchHistoryStore>);
+export function useWatchHistory(enabled = true) {
+  const history = useContext(HistoryCtx);
+  const snapshot = useRef(history.getSnapshot());
+  const subscribe = useCallback((listener: () => void) => enabled ? history.subscribe(listener) : () => {}, [history, enabled]);
+  const getSnapshot = useCallback(() => {
+    if (enabled) snapshot.current = history.getSnapshot();
+    return snapshot.current;
+  }, [history, enabled]);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
 let seq = 0;
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [p, setP] = useState<Persist>(loadPersist);
+  const persistRef = useRef(p); persistRef.current = p;
+  const [historyStore] = useState(() => createWatchHistoryStore(p.history, history => {
+    try { localStorage.setItem(LS, JSON.stringify({ ...persistRef.current, history })); } catch { /* ignore */ }
+  }));
   const [theme, setThemeState] = useState<Theme>(readTheme);
   const [tab, setTabRaw] = useState<Tab>("home");
   const [searchScope, setSearchScope] = useState<"video" | "post">("video");
@@ -196,8 +210,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [theme]);
 
   useEffect(() => {
-    try { localStorage.setItem(LS, JSON.stringify(p)); } catch { /* ignore */ }
-  }, [p]);
+    // 偏好变化也合并最新历史，避免旧p.history覆盖同步边界保存。
+    try { localStorage.setItem(LS, JSON.stringify({ ...p, history: historyStore.getSnapshot() })); } catch { /* ignore */ }
+  }, [p, historyStore]);
 
   useEffect(() => {
     api.boot()
@@ -302,22 +317,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
     return on;
   }, []);
-  const addHistory = useCallback((id: number, ep?: number, t?: number, dur?: number) => {
-    if (!id) return;
-    setP((s) => {
-      const prev = s.history.find((x) => x.id === id);
-      const epChanged = ep !== undefined && prev !== undefined && prev.ep !== ep;
-      const entry: WatchProgress = {
-        id,
-        ep: ep ?? prev?.ep ?? 1,
-        t: epChanged ? 0 : (t ?? prev?.t ?? 0),
-        dur: dur ?? prev?.dur ?? 0,
-        at: Date.now(),
-      };
-      return { ...s, history: [entry, ...s.history.filter((x) => x.id !== id)].slice(0, 80) };
-    });
-  }, []);
-  const clearHistory = useCallback(() => setP((s) => ({ ...s, history: [] })), []);
+  const addHistory = historyStore.add;
+  const clearHistory = historyStore.clear;
   const addSearch = useCallback((q: string) => {
     const t = q.trim();
     if (!t) return;
@@ -367,7 +368,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     theme, setTheme: setThemeState,
     tab, setTab, searchScope, setSearchScope, stack, push, pop,
     user, setUser, loginOpen, setLoginOpen, logout,
-    likes: p.likes, favs: p.favs, history: p.history, follows: p.follows,
+    likes: p.likes, favs: p.favs, follows: p.follows,
     isLiked: (id) => p.likes.includes(id),
     isFav: (id) => p.favs.includes(id),
     toggleLikeLocal, toggleFavLocal, toggleFollowLocal, addHistory, clearHistory,
@@ -383,5 +384,5 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setMuted, setMuteOnStartup, setSwipeEp, setPreferHevc, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     toasts, toast, lineEpoch, theater, setTheater, fs, setFs, clean, setClean]);
 
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+  return <HistoryCtx.Provider value={historyStore}><Ctx.Provider value={value}>{children}</Ctx.Provider></HistoryCtx.Provider>;
 }

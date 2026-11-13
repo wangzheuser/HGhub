@@ -1,5 +1,6 @@
 //! 单片下载的被动阶段统计；不记录 URL，也不发起额外测速。
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(super) struct DownloadTrace {
@@ -45,6 +46,87 @@ impl DownloadTrace {
             "full_get"
         } else {
             "none"
+        }
+    }
+}
+
+/// 每个父下载只写一次摘要；Drop 覆盖父 future 取消，不在逐 chunk 路径写日志。
+/// 这里只保存资源散列，不保存 URL；取消时 bytes 为空，不冒充已读正文或线缆字节。
+pub(super) struct DownloadSummaryGuard {
+    resource: String,
+    requested_parts: usize,
+    trace: Arc<DownloadTrace>,
+    finished: bool,
+}
+
+impl DownloadSummaryGuard {
+    pub fn new(resource: String, requested_parts: usize, trace: Arc<DownloadTrace>) -> Self {
+        Self {
+            resource,
+            requested_parts,
+            trace,
+            finished: false,
+        }
+    }
+
+    fn summary(
+        &self,
+        bytes: Option<usize>,
+        error_kind: Option<&str>,
+        cancelled: bool,
+    ) -> serde_json::Value {
+        let trace = &self.trace;
+        serde_json::json!({
+            "resource": self.resource,
+            "requested_parts": self.requested_parts,
+            "concurrency": trace.concurrency.load(Ordering::Relaxed),
+            "request_count": trace.requests.load(Ordering::Relaxed),
+            "probe_headers_ms": trace.probe_headers_ms.load(Ordering::Relaxed),
+            "probe_read_ms": trace.probe_read_ms.load(Ordering::Relaxed),
+            "slowest_range_ms": trace.slowest_range_ms.load(Ordering::Relaxed),
+            "fallback_count": trace.fallback.load(Ordering::Relaxed),
+            "recovery_kind": trace.recovery_kind(),
+            "tail_rescue": trace.tail_rescue.load(Ordering::Relaxed) != 0,
+            "tail_threshold_ms": trace.tail_threshold_ms.load(Ordering::Relaxed),
+            "tail_wait_ms": trace.tail_wait_ms.load(Ordering::Relaxed),
+            "tail_read_ms": trace.tail_read_ms.load(Ordering::Relaxed),
+            "elapsed_ms": trace.started.elapsed().as_millis() as u64,
+            "bytes": bytes,
+            "error_kind": error_kind,
+            "cancelled": cancelled,
+        })
+    }
+
+    fn emit(&self, bytes: Option<usize>, error_kind: Option<&str>, cancelled: bool) {
+        if crate::playback_log::enabled() {
+            crate::playback_log::record(
+                "network.download",
+                self.summary(bytes, error_kind, cancelled),
+            );
+        }
+    }
+
+    pub fn finish(&mut self, result: &Result<super::MediaBytes, String>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.emit(
+            result.as_ref().ok().map(|(_, bytes)| bytes.len()),
+            result
+                .as_ref()
+                .err()
+                .map(|error| crate::playback_log::error_kind(error)),
+            false,
+        );
+    }
+}
+
+impl Drop for DownloadSummaryGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            // 取消摘要是父边界快照；子任务Drop稍后完成的阶段计时不保证已计入。
+            self.emit(None, Some("cancelled"), true);
         }
     }
 }
@@ -125,6 +207,33 @@ pub(super) fn parse_parts(value: Option<&str>, fallback: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_summary_keeps_counters_without_claiming_body_bytes() {
+        let trace = Arc::new(DownloadTrace::new());
+        trace.requests.store(5, Ordering::Relaxed);
+        trace.concurrency.store(4, Ordering::Relaxed);
+        trace.fallback.store(1, Ordering::Relaxed);
+        // 只测纯payload，不触碰全局诊断开关或文件日志。
+        let summary = DownloadSummaryGuard {
+            resource: "r123".into(),
+            requested_parts: 4,
+            trace,
+            finished: true,
+        };
+        let cancelled = summary.summary(None, Some("cancelled"), true);
+        assert_eq!(cancelled["resource"], "r123");
+        assert_eq!(cancelled["request_count"], 5);
+        assert_eq!(cancelled["concurrency"], 4);
+        assert_eq!(cancelled["recovery_kind"], "full_get");
+        assert_eq!(cancelled["cancelled"], true);
+        assert_eq!(cancelled["error_kind"], "cancelled");
+        assert!(cancelled["bytes"].is_null());
+        let completed = summary.summary(Some(64), None, false);
+        assert_eq!(completed["bytes"], 64);
+        assert_eq!(completed["cancelled"], false);
+        assert!(completed["error_kind"].is_null());
+    }
 
     #[test]
     fn supported_profiles_are_explicit_and_bounded() {

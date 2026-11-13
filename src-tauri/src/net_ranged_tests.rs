@@ -441,6 +441,83 @@ async fn parent_cancellation_drops_all_inflight_children() {
 }
 
 #[tokio::test]
+async fn ordinary_phase_timeout_drains_children_before_single_full_fallback() {
+    // 全内存响应与 pending future；不监听端口、不访问网络，也不等待生产20s窗口。
+    let active = Arc::new(AtomicUsize::new(0));
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(AtomicUsize::new(0));
+    let full = Arc::new(AtomicUsize::new(0));
+    let count = active.clone();
+    let signal = changed.clone();
+    let entered = started.clone();
+    let fallbacks = full.clone();
+    let trace = Arc::new(DownloadTrace::new());
+    let policy = TailPolicy {
+        phase_budget: Duration::from_millis(100),
+        minimum_samples: usize::MAX,
+        ..TailPolicy::default()
+    };
+    let (_, bytes) = tokio::time::timeout(
+        Duration::from_secs(2),
+        fetch_bytes_ranged_with_policy(
+            move |span: Span| {
+                let count = count.clone();
+                let signal = signal.clone();
+                let entered = entered.clone();
+                let fallbacks = fallbacks.clone();
+                async move {
+                    if span.is_some_and(|(start, _)| start > 0) {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let _guard = ActiveRequest(count, signal);
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    } else if span.is_none() {
+                        assert_eq!(
+                            entered.load(Ordering::SeqCst),
+                            4,
+                            "普通相位应先启动全部区间"
+                        );
+                        assert_eq!(count.load(Ordering::SeqCst), 0, "full发出前旧active必须为0");
+                        fallbacks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let response = if span.is_some() {
+                        tauri::http::Response::builder()
+                            .status(206)
+                            .header("Content-Range", "bytes 0-65535/1200000")
+                            .header("Content-Length", RANGE_PROBE_BYTES.to_string())
+                            .body(vec![b'x'; RANGE_PROBE_BYTES as usize])
+                            .unwrap()
+                    } else {
+                        tauri::http::Response::builder()
+                            .status(200)
+                            .header("Content-Length", "4")
+                            .body(b"good".to_vec())
+                            .unwrap()
+                    };
+                    Ok(reqwest::Response::from(response))
+                }
+            },
+            4,
+            trace.clone(),
+            policy,
+        ),
+    )
+    .await
+    .expect("普通相位超时应回收pending任务并完成单次full回退")
+    .unwrap();
+    assert_eq!(bytes, b"good");
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(full.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        trace.requests.load(Ordering::Relaxed),
+        6,
+        "首探+4区间+1整包"
+    );
+    assert_eq!(trace.fallback.load(Ordering::Relaxed), 1);
+    assert_eq!(trace.tail_rescue.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn first_failure_aborts_siblings_before_single_fallback() {
     let data = payload(1200000);
     let server = Server::start(move |span, stream| range_reply(stream, span, &data));

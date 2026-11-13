@@ -39,7 +39,7 @@ export async function optimizationUnitChecks() {
     { start: 10, duration: 10, url: "http://hg.localhost/seg?u=https%3A%2F%2Ffixture.invalid%2Fb.ts" },
   ] } }] } as unknown as Hls;
   try {
-    const controller = createSeekPrefetch(() => hls);
+    const controller = createSeekPrefetch(() => hls, { prefetch: url => api.mediaPrefetch(url), cancel: url => api.mediaPrefetchCancel(url) });
     controller.at(2); controller.cancel(); await wait(150);
     check(calls.length === 0, "Cancelled debounce must not dispatch or cancel unrelated server tasks");
     controller.at(2); await wait(150);

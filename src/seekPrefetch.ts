@@ -1,12 +1,19 @@
 import type Hls from "hls.js";
-import { api } from "./api";
 
 export type SeekPrefetch = {
   at: (t: number) => void;
-  /** 松手立即交接最终目标；保留在途同片下载供前台复用。 */
+  /** 松手交接最终目标；同片在途不重复派发。 */
   commit: (t: number) => void;
-  /** 取消计时器及已发出的、URL 匹配的服务端推测。 */
+  /** 仅撤销自己发出的原始 URL。 */
   cancel: () => void;
+};
+export type SeekPrefetchDependencies = {
+  prefetch: (url: string) => Promise<boolean>;
+  cancel: (url: string) => Promise<unknown>;
+  isBuffered?: (time: number) => boolean;
+  now?: () => number;
+  schedule?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clear?: (timer: ReturnType<typeof setTimeout>) => void;
 };
 
 /** 本地代理媒体地址还原，原生/远端地址保持不变。 */
@@ -32,14 +39,19 @@ export function healthyBuffer(time: number, duration: number, end: number): bool
   return remaining > 0 && end - time >= Math.min(8, remaining) - 0.05;
 }
 
-/** 单一目标、120ms 去抖；提交时保留同片，取消/换源时精确撤销旧任务。 */
-export function createSeekPrefetch(getHls: () => Hls | null): SeekPrefetch {
-  let pendingUrl = "";
-  let firedUrl = "";
-  let timer: number | null = null;
-  const clearTimer = () => {
-    if (timer !== null) window.clearTimeout(timer);
-    timer = null;
+/** 单一目标、120ms去抖；缓冲命中不发RPC，同一连续目标失败最多显式重试一次。 */
+export function createSeekPrefetch(getHls: () => Hls | null, deps: SeekPrefetchDependencies): SeekPrefetch {
+  const now = deps.now ?? Date.now, schedule = deps.schedule ?? setTimeout, clear = deps.clear ?? clearTimeout;
+  let pendingUrl = "", firedUrl = "", attemptUrl = "";
+  let attempts = 0, lastAttempt = -Infinity, generation = 0, pendingTime = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancellation: Promise<unknown> = Promise.resolve(), cancelPending = 0, cancelledGeneration = -1;
+  const clearTimer = () => { if (timer !== undefined) clear(timer); timer = undefined; };
+  const cancelUrl = (url: string) => {
+    if (!url) return;
+    cancelPending++;
+    const request = deps.cancel(url).catch(() => {}).finally(() => { cancelPending--; });
+    cancellation = Promise.all([cancellation.catch(() => {}), request]);
   };
   const targetUrl = (t: number) => {
     const hls = getHls();
@@ -53,31 +65,54 @@ export function createSeekPrefetch(getHls: () => Hls | null): SeekPrefetch {
     if (!frag?.url || !frag.url.includes("?u=")) return "";
     return originalMediaUrl(frag.url);
   };
+  const buffered = (t: number) => {
+    if (!Number.isFinite(t) || !deps.isBuffered?.(t)) return false;
+    clearTimer(); pendingUrl = "";
+    // 已派发的同片可能正在被当前播放复用；缓冲快路径不额外发取消或换代RPC。
+    return true;
+  };
   const fire = () => {
     clearTimer();
-    if (pendingUrl && pendingUrl !== firedUrl) {
-      firedUrl = pendingUrl;
-      void api.mediaPrefetch(firedUrl);
-    }
+    const url = pendingUrl;
+    if (!url || buffered(pendingTime) || url === firedUrl) return;
+    if (url !== attemptUrl) { attemptUrl = url; attempts = 0; lastAttempt = -Infinity; }
+    if (attempts >= 2) return;
+    if (now() - lastAttempt < 300) { timer = schedule(fire, 300 - (now() - lastAttempt)); return; }
+    attempts++; lastAttempt = now(); firedUrl = url;
+    const requestGeneration = ++generation;
+    const dispatch = () => {
+      if (requestGeneration !== generation || pendingUrl !== url || buffered(pendingTime)) return;
+      let request: Promise<boolean>;
+      try { request = deps.prefetch(url); } catch { request = Promise.resolve(false); }
+      void request.catch(() => false).then(accepted => {
+        if (requestGeneration !== generation) {
+          // cancel已排在原prefetch之后；晚ACK不再追加cancel误伤重挂的新同片请求。
+          if (accepted && requestGeneration > cancelledGeneration && firedUrl !== url) cancelUrl(url);
+          return;
+        }
+        if (!accepted && firedUrl === url) firedUrl = "";
+      });
+    };
+    if (cancelPending) void cancellation.then(dispatch); else dispatch();
   };
   return {
     at(t) {
+      if (buffered(t)) return;
       const url = targetUrl(t);
-      if (!url || url === pendingUrl) return;
-      pendingUrl = url;
-      clearTimer();
-      timer = window.setTimeout(fire, 120);
+      if (!url || (url === pendingUrl && (timer !== undefined || firedUrl === url))) return;
+      pendingTime = t; pendingUrl = url; clearTimer(); timer = schedule(fire, 120);
     },
     commit(t) {
+      if (buffered(t)) return;
       const url = targetUrl(t);
-      if (url) pendingUrl = url;
-      fire();
+      if (!url) { clearTimer(); pendingUrl = ""; return; }
+      pendingTime = t; pendingUrl = url; fire();
     },
     cancel() {
-      clearTimer();
-      if (firedUrl) void api.mediaPrefetchCancel(firedUrl);
-      pendingUrl = "";
-      firedUrl = "";
+      clearTimer(); cancelledGeneration = generation; generation++;
+      const previous = firedUrl;
+      pendingUrl = ""; firedUrl = ""; attemptUrl = ""; attempts = 0; lastAttempt = -Infinity;
+      cancelUrl(previous);
     },
   };
 }
